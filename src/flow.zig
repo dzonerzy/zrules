@@ -105,12 +105,21 @@ const Flow = struct {
     /// Bitset words of a state in this function
     words: usize,
     loop: ?*Loop = null,
-    /// Assignments whose statement hasn't ended yet
-    pending: std.ArrayList(Pending) = .empty,
-    /// Bitsets no longer in use
-    spare: std.ArrayList([]usize) = .empty,
+    /// Buffers shared with the other functions at the same nesting depth
+    level: *Level,
     /// Variables already reported (allocated at the first report)
     reported: []usize = &.{},
+};
+
+/// What the functions at one nesting depth reuse, one after the other: the
+/// thousands of functions of a file allocate their states once, not each
+const Level = struct {
+    /// Length of every buffer in `spare`: the most words a function here needed
+    size: usize = 0,
+    /// Bitsets no longer in use
+    spare: std.ArrayList([*]usize) = .empty,
+    /// Assignments whose statement hasn't ended yet
+    pending: std.ArrayList(Pending) = .empty,
 };
 
 pub const Analysis = struct {
@@ -124,12 +133,17 @@ pub const Analysis = struct {
     /// Per node: the bit of the followed variable it uses or assigns, in the
     /// function that declares it; NONE otherwise
     bit: []u32 = &.{},
-    /// Per assigning node: the node index at which the value is there
-    effect: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+    /// Per assigning node (flags.assign): the node index at which the value is there
+    effect: []u32 = &.{},
     /// Function node (NONE = the top level) -> its number of followed variables
     counts: std.AutoHashMapUnmanaged(u32, u32) = .empty,
     arms_given: bool = false,
     depth: u32 = 0,
+    /// Per nesting depth of functions (0 = the top level)
+    levels: std.ArrayList(*Level) = .empty,
+    levels_in_use: usize = 0,
+    /// The storage of states with no variables to follow
+    no_words: [1]usize = .{0},
 
     const Error = Allocator.Error;
 
@@ -168,9 +182,33 @@ pub const Analysis = struct {
 
         try self.prepareVariables();
 
-        var flow = Flow{ .words = self.wordsOf(NONE) };
+        var flow = try self.enter(NONE);
         var state = try self.fresh(&flow, true);
         try self.walk(0, &state, &flow);
+    }
+
+    /// The flow of a function (or the top level), at the next nesting depth.
+    fn enter(self: *Analysis, function: u32) Error!Flow {
+        const depth = self.levels_in_use;
+        if (depth == self.levels.items.len) {
+            const level = try self.arena.create(Level);
+            level.* = .{};
+            try self.levels.append(self.arena, level);
+        }
+        self.levels_in_use += 1;
+        const level = self.levels.items[depth];
+        const words = self.wordsOf(function);
+        if (words > level.size) {
+            // Too small for this one: start over with larger buffers
+            level.spare.clearRetainingCapacity();
+            level.size = words;
+        }
+        level.pending.clearRetainingCapacity();
+        return .{ .words = words, .level = level };
+    }
+
+    fn leave(self: *Analysis) void {
+        self.levels_in_use -= 1;
     }
 
     fn report(self: *Analysis, kind: ProblemKind, node: u32) Error!void {
@@ -205,6 +243,8 @@ pub const Analysis = struct {
 
         self.bit = try self.arena.alloc(u32, n);
         @memset(self.bit, NONE);
+        // Only read where flags.assign is set, which is where it is written
+        self.effect = try self.arena.alloc(u32, n);
         // Per symbol: its bit in the function that declares it
         const symbol_bit = try self.arena.alloc(u32, names.symbols.items.len);
         @memset(symbol_bit, NONE);
@@ -270,7 +310,7 @@ pub const Analysis = struct {
             if (symbol_bit[sym] == NONE) continue;
             self.bit[target] = symbol_bit[sym];
             self.flags[target].assign = true;
-            try self.effect.put(self.arena, target, t.end(entry.assign));
+            self.effect[target] = t.end(entry.assign);
         }
         // A declaration with a value (a second one, of a followed name) gives it
         for (self.in.variables) |decl| {
@@ -291,7 +331,7 @@ pub const Analysis = struct {
         if (symbol_bit[sym] == NONE or function_of[name] != function_of[names.symbols.items[sym].node]) return;
         self.bit[name] = symbol_bit[sym];
         self.flags[name].assign = true;
-        try self.effect.put(self.arena, name, at);
+        self.effect[name] = at;
     }
 
     const Labelled = struct {
@@ -350,7 +390,11 @@ pub const Analysis = struct {
 
     /// A bitset of the function's size: one given back, or a new one.
     fn buffer(self: *Analysis, flow: *Flow) Error![]usize {
-        return flow.spare.pop() orelse try self.arena.alloc(usize, flow.words);
+        // Most functions follow no variable: their states are empty
+        if (flow.words == 0) return self.no_words[0..0];
+        const level = flow.level;
+        const ptr = level.spare.pop() orelse (try self.arena.alloc(usize, level.size)).ptr;
+        return ptr[0..flow.words];
     }
 
     fn fresh(self: *Analysis, flow: *Flow, live: bool) Error!State {
@@ -370,8 +414,9 @@ pub const Analysis = struct {
     /// A state no path continues from: its bitsets serve the next one, so
     /// the memory in use follows the nesting, not the number of branches.
     fn release(self: *Analysis, flow: *Flow, state: State) Error!void {
-        try flow.spare.append(self.arena, state.all);
-        try flow.spare.append(self.arena, state.some);
+        if (flow.words == 0) return;
+        try flow.level.spare.append(self.arena, state.all.ptr);
+        try flow.level.spare.append(self.arena, state.some.ptr);
     }
 
     /// Two paths join: a variable has a value if it has one on both (a path
@@ -400,13 +445,13 @@ pub const Analysis = struct {
     /// Assignments whose statement ends at or before `at` have happened.
     fn settle(flow: *Flow, state: *State, at: u32) void {
         var i: usize = 0;
-        while (i < flow.pending.items.len) {
-            if (flow.pending.items[i].at > at) {
+        while (i < flow.level.pending.items.len) {
+            if (flow.level.pending.items[i].at > at) {
                 i += 1;
                 continue;
             }
-            give(state, flow.pending.items[i].bit);
-            _ = flow.pending.swapRemove(i);
+            give(state, flow.level.pending.items[i].bit);
+            _ = flow.level.pending.swapRemove(i);
         }
     }
 
@@ -449,7 +494,7 @@ pub const Analysis = struct {
         try self.visit(node, state, flow);
         var i = node + 1;
         while (i < stop) {
-            if (flow.pending.items.len != 0) settle(flow, state, i);
+            if (flow.level.pending.items.len != 0) settle(flow, state, i);
             if (self.kind[i] != .plain) {
                 try self.walk(i, state, flow);
                 i = t.end(i);
@@ -458,7 +503,7 @@ pub const Analysis = struct {
             try self.visit(i, state, flow);
             i += 1;
         }
-        if (flow.pending.items.len != 0) settle(flow, state, stop);
+        if (flow.level.pending.items.len != 0) settle(flow, state, stop);
     }
 
     /// One node: a use of a followed variable, or an assignment to one.
@@ -467,7 +512,7 @@ pub const Analysis = struct {
         const bit = self.bit[node];
         if (bit == NONE) return;
         if (self.flags[node].assign) {
-            try flow.pending.append(self.arena, .{ .at = self.effect.get(node).?, .bit = bit });
+            try flow.level.pending.append(self.arena, .{ .at = self.effect[node], .bit = bit });
             return;
         }
         if (!state.live or has(state.all, bit)) return;
@@ -487,7 +532,7 @@ pub const Analysis = struct {
         var reported = !state.live;
         var c = node + 1;
         while (c < stop) : (c = t.end(c)) {
-            if (flow.pending.items.len != 0) settle(flow, state, c);
+            if (flow.level.pending.items.len != 0) settle(flow, state, c);
             // A function written after a `return` is still a definition
             if (!state.live and !reported and self.kind[c] != .function) {
                 try self.report(.dead, c);
@@ -495,7 +540,7 @@ pub const Analysis = struct {
             }
             try self.walk(c, state, flow);
         }
-        if (flow.pending.items.len != 0) settle(flow, state, stop);
+        if (flow.level.pending.items.len != 0) settle(flow, state, stop);
     }
 
     fn isArm(self: *const Analysis, node: u32) bool {
@@ -511,7 +556,7 @@ pub const Analysis = struct {
         var exhaustive = false;
         var c = node + 1;
         while (c < stop) : (c = t.end(c)) {
-            if (flow.pending.items.len != 0) settle(flow, state, c);
+            if (flow.level.pending.items.len != 0) settle(flow, state, c);
             if (!self.isArm(c)) {
                 // A condition: evaluated on the way to the arms after it
                 try self.walk(c, state, flow);
@@ -519,7 +564,7 @@ pub const Analysis = struct {
             }
             var arm = try self.copy(flow, state.*);
             try self.walk(c, &arm, flow);
-            if (flow.pending.items.len != 0) settle(flow, &arm, t.end(c));
+            if (flow.level.pending.items.len != 0) settle(flow, &arm, t.end(c));
             meet(&out, arm);
             try self.release(flow, arm);
             // A nested branch stands for everything else: what it doesn't
@@ -539,7 +584,7 @@ pub const Analysis = struct {
         var before: ?State = null;
         var c = node + 1;
         while (c < stop) : (c = t.end(c)) {
-            if (flow.pending.items.len != 0) settle(flow, state, c);
+            if (flow.level.pending.items.len != 0) settle(flow, state, c);
             if (before != null or self.kind[c] != .sequence) {
                 // Before the body: the condition. After it: the step of a
                 // `for`, the condition of a `do ... while`.
@@ -551,7 +596,7 @@ pub const Analysis = struct {
             flow.loop = &frame;
             try self.walk(c, state, flow);
             flow.loop = outer;
-            if (flow.pending.items.len != 0) settle(flow, state, t.end(c));
+            if (flow.level.pending.items.len != 0) settle(flow, state, t.end(c));
             // The end of an iteration: the end of the body, or a `continue`
             meet(state, frame.continues);
         }
@@ -572,7 +617,8 @@ pub const Analysis = struct {
 
     /// A function: a flow of its own, starting with nothing given a value.
     fn functionFlow(self: *Analysis, node: u32) Error!void {
-        var flow = Flow{ .words = self.wordsOf(node) };
+        var flow = try self.enter(node);
+        defer self.leave();
         var state = try self.fresh(&flow, true);
         try self.scan(node, &state, &flow);
         if (self.flags[node].must_return and state.live) {

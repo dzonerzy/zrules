@@ -116,6 +116,18 @@ pub const Result = struct {
     }
 };
 
+const NodeFlags = packed struct(u8) {
+    /// Opens a scope
+    scope: bool = false,
+    /// Belongs to the scope outside the one it is written in (`outside`)
+    lifted: bool = false,
+    definition: bool = false,
+    member_name: bool = false,
+    /// A use that resolved (grouped by symbol at the end)
+    resolved_use: bool = false,
+    _: u3 = 0,
+};
+
 /// (scope, name id): names are interned once, so the table hashes two ints
 fn key(scope: u32, name: u32) u64 {
     return (@as(u64, scope) << 32) | name;
@@ -135,22 +147,25 @@ pub fn analyze(
 ) !Result {
     const n_nodes = t.nodes.len;
 
+    // What each node is, in one byte per node (one allocation to clear, not five)
+    const flags = try arena.alloc(NodeFlags, n_nodes);
+    @memset(flags, .{});
+    for (scopes) |s| flags[s].scope = true;
+    // An `outside` node, and what is in it, belongs to the scope outside
+    // the one it is written in (its descendants inherit that)
+    for (options.outside) |s| flags[s].lifted = true;
+    // A node that defines a name is not also a use of it
+    for (definitions) |d| flags[d.node].definition = true;
+    // The name of a member access is looked up in its target's scope, not
+    // through the scopes around it
+    for (members) |m| flags[m.name].member_name = true;
+
     // Nearest scope strictly above each node (NONE = global). Parents come
     // before their children, so one forward pass does it.
     const above = try arena.alloc(u32, n_nodes);
-    {
-        const is_scope = try arena.alloc(bool, n_nodes);
-        @memset(is_scope, false);
-        for (scopes) |s| is_scope[s] = true;
-        // An `outside` node, and what is in it, belongs to the scope outside
-        // the one it is written in (its descendants inherit that)
-        const lifted = try arena.alloc(bool, n_nodes);
-        @memset(lifted, false);
-        for (options.outside) |s| lifted[s] = true;
-        for (above, t.parents, lifted) |*slot, parent, lift| {
-            slot.* = if (parent == NONE) NONE else if (is_scope[parent]) parent else above[parent];
-            if (lift and slot.* != NONE) slot.* = above[slot.*];
-        }
+    for (above, t.parents, flags) |*slot, parent, f| {
+        slot.* = if (parent == NONE) NONE else if (flags[parent].scope) parent else above[parent];
+        if (f.lifted and slot.* != NONE) slot.* = above[slot.*];
     }
 
     var names: std.StringHashMapUnmanaged(u32) = .empty;
@@ -162,10 +177,6 @@ pub fn analyze(
     try table.ensureTotalCapacity(arena, @intCast(@min(definitions.len + builtins.len, std.math.maxInt(u32) / 2)));
     const by_node = try arena.alloc(u32, n_nodes);
     @memset(by_node, NONE);
-    // A node that defines a name is not also a use of it
-    const is_definition = try arena.alloc(bool, n_nodes);
-    @memset(is_definition, false);
-    for (definitions) |d| is_definition[d.node] = true;
 
     for (builtins) |name| {
         const id = try names.getOrPutValue(arena, name, names.count());
@@ -182,15 +193,6 @@ pub fn analyze(
         entry.value_ptr.* = @intCast(symbols.items.len);
         try symbols.append(arena, .{ .name = ext.name, .node = NONE, .scope = NONE, .hoisted = true, .origin_file = ext.file, .origin_node = ext.node });
     }
-
-    // The name of a member access is looked up in its target's scope, not
-    // through the scopes around it
-    const is_member_name = try arena.alloc(bool, n_nodes);
-    @memset(is_member_name, false);
-    for (members) |m| is_member_name[m.name] = true;
-    // Uses that resolved, to group by symbol at the end
-    const is_resolved_use = try arena.alloc(bool, n_nodes);
-    @memset(is_resolved_use, false);
 
     for (definitions) |d| {
         var scope = above[d.node];
@@ -234,7 +236,7 @@ pub fn analyze(
     @memset(use_count, 0);
     var resolved: usize = 0;
     for (uses) |use| {
-        if (is_definition[use] or is_member_name[use]) continue;
+        if (flags[use].definition or flags[use].member_name) continue;
         const id = names.get(t.text(use)) orelse {
             if (!options.assume_defined) try problems.append(arena, .{ .kind = .undefined, .node = use });
             continue;
@@ -253,7 +255,7 @@ pub fn analyze(
         };
         if (found) |index| {
             by_node[use] = index;
-            is_resolved_use[use] = true;
+            flags[use].resolved_use = true;
             use_count[index + 1] += 1;
             resolved += 1;
         } else if (!options.assume_defined) {
@@ -280,8 +282,8 @@ pub fn analyze(
         if (found) |index| {
             by_node[m.name] = index;
             by_node[m.node] = index;
-            if (!is_definition[m.name]) {
-                is_resolved_use[m.name] = true;
+            if (!flags[m.name].definition) {
+                flags[m.name].resolved_use = true;
                 use_count[index + 1] += 1;
                 resolved += 1;
             }
@@ -294,8 +296,8 @@ pub fn analyze(
     for (1..use_count.len) |i| use_count[i] += use_count[i - 1];
     const all_uses = try arena.alloc(u32, resolved);
     const next = try arena.dupe(u32, use_count[0..symbols.items.len]);
-    for (is_resolved_use, 0..) |yes, node| {
-        if (!yes) continue;
+    for (flags, 0..) |f, node| {
+        if (!f.resolved_use) continue;
         const index = by_node[node];
         all_uses[next[index]] = @intCast(node);
         next[index] += 1;

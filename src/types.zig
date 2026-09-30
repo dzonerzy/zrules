@@ -62,7 +62,10 @@ const MAX_PARSE_DEPTH = 64;
 
 const What = enum(u8) { expr, symbol, type_node };
 
-const Work = struct {
+/// The depth bookkeeping of the checkers that work on one thread
+pub const Work = struct {
+    /// Where `pending` lives
+    arena: Allocator,
     depth: u32 = 0,
     /// Times the depth limit was hit: a computation during which this moved
     /// is incomplete, and is neither remembered nor allowed to report
@@ -80,39 +83,84 @@ const Frame = struct {
     problems: usize,
 };
 
-/// Every type of a check, interned: equal types have equal ids.
+/// Types are stored in chunks that never move, so that a thread can read a
+/// type while another one adds some
+const CHUNK_BITS = 10;
+const CHUNK = 1 << CHUNK_BITS;
+const MAX_CHUNKS = 16 * 1024;
+
+/// Every type of a check, interned: equal types have equal ids. Shared by
+/// the files of a project, which may be checked on several threads: adding
+/// a type takes a lock, reading one doesn't.
 pub const Table = struct {
     arena: Allocator,
-    types: std.ArrayList(Type) = .empty,
-    /// Canonical spelling -> id
+    chunks: []?[*]Type,
+    len: u32 = 0,
+    /// Canonical spelling -> id (under the lock)
     index: std.StringHashMapUnmanaged(TypeId) = .empty,
-    /// Shared by the checkers of every file: types depend on one another across files
-    work: Work = .{},
+    /// The depth bookkeeping while the checkers of every file work on one
+    /// thread (they work out each other's types)
+    work: Work,
     /// What a function type written without a result (`fn(int)`) returns
     void_name: []const u8 = "void",
+    /// Where intern() spells a type to look it up (under the lock)
+    spelling: std.ArrayList(u8) = .empty,
+    lock: std.atomic.Mutex = .unlocked,
 
     pub fn init(arena: Allocator) !Table {
-        var self = Table{ .arena = arena };
-        try self.types.append(arena, .{});
+        var self = Table{ .arena = arena, .chunks = try arena.alloc(?[*]Type, MAX_CHUNKS), .work = .{ .arena = arena } };
+        @memset(self.chunks, null);
+        _ = try self.add(.{});
         return self;
     }
 
     pub fn get(self: *const Table, id: TypeId) Type {
-        return self.types.items[id];
+        return self.chunks[id >> CHUNK_BITS].?[id & (CHUNK - 1)];
     }
 
-    fn intern(self: *Table, t: Type) !TypeId {
-        var key: std.ArrayList(u8) = .empty;
-        try self.write(&key, t, true);
-        const entry = try self.index.getOrPut(self.arena, key.items);
-        if (!entry.found_existing) {
-            entry.value_ptr.* = @intCast(self.types.items.len);
-            // The table outlives the sources its names were read from
-            var kept = t;
-            kept.name = try self.arena.dupe(u8, t.name);
-            try self.types.append(self.arena, kept);
+    fn add(self: *Table, t: Type) !TypeId {
+        const id = self.len;
+        if (id >= MAX_CHUNKS * CHUNK) return error.OutOfMemory;
+        const chunk = &self.chunks[id >> CHUNK_BITS];
+        if (chunk.* == null) chunk.* = (try self.arena.alloc(Type, CHUNK)).ptr;
+        chunk.*.?[id & (CHUNK - 1)] = t;
+        self.len = id + 1;
+        return id;
+    }
+
+    fn acquire(self: *Table) void {
+        var spins: u32 = 0;
+        while (!self.lock.tryLock()) {
+            // Held for a hash lookup: spin a little, then let the holder
+            // run (it may have been descheduled)
+            spins += 1;
+            if (spins < 64) std.atomic.spinLoopHint() else std.Thread.yield() catch {};
         }
-        return entry.value_ptr.*;
+    }
+
+    /// The id of a type: looked up by its spelling (built in a reused
+    /// buffer), and copied into the table only the first time.
+    fn intern(self: *Table, t: Type) !TypeId {
+        self.acquire();
+        defer self.lock.unlock();
+        self.spelling.clearRetainingCapacity();
+        try self.write(self.arena, &self.spelling, t, true);
+        if (self.index.get(self.spelling.items)) |id| return id;
+        // The table outlives the sources its names were read from
+        var kept = t;
+        kept.name = try self.arena.dupe(u8, t.name);
+        kept.args = try self.arena.dupe(TypeId, t.args);
+        const id = try self.add(kept);
+        try self.index.put(self.arena, try self.arena.dupe(u8, self.spelling.items), id);
+        return id;
+    }
+
+    /// The basic type of that name, if there is one.
+    pub fn basicNamed(self: *Table, name: []const u8) ?TypeId {
+        self.acquire();
+        defer self.lock.unlock();
+        const id = self.index.get(name) orelse return null;
+        return if (self.get(id).kind == .basic) id else null;
     }
 
     pub fn basic(self: *Table, name: []const u8) !TypeId {
@@ -124,17 +172,16 @@ pub const Table = struct {
     }
 
     pub fn generic(self: *Table, name: []const u8, args: []const TypeId) !TypeId {
-        return self.intern(.{ .kind = .generic, .name = name, .args = try self.arena.dupe(TypeId, args) });
+        return self.intern(.{ .kind = .generic, .name = name, .args = args });
     }
 
     pub fn function(self: *Table, params: []const TypeId, ret: TypeId, variadic: bool) !TypeId {
-        return self.intern(.{ .kind = .function, .args = try self.arena.dupe(TypeId, params), .ret = ret, .variadic = variadic });
+        return self.intern(.{ .kind = .function, .args = params, .ret = ret, .variadic = variadic });
     }
 
     /// Spell a type. `exact` tells two declared types of the same name
     /// apart (the interning key); without it, it is what a user reads.
-    fn write(self: *const Table, out: *std.ArrayList(u8), t: Type, exact: bool) Allocator.Error!void {
-        const a = self.arena;
+    fn write(self: *const Table, a: Allocator, out: *std.ArrayList(u8), t: Type, exact: bool) Allocator.Error!void {
         switch (t.kind) {
             .unknown => try out.appendSlice(a, "unknown"),
             .basic => try out.appendSlice(a, t.name),
@@ -147,14 +194,14 @@ pub const Table = struct {
             },
             .generic => {
                 if (std.mem.eql(u8, t.name, "?") and t.args.len == 1 and !exact) {
-                    try self.write(out, self.get(t.args[0]), exact);
+                    try self.write(a, out, self.get(t.args[0]), exact);
                     return out.append(a, '?');
                 }
                 try out.appendSlice(a, t.name);
                 try out.append(a, '[');
                 for (t.args, 0..) |arg, i| {
                     if (i != 0) try out.appendSlice(a, ", ");
-                    try self.write(out, self.get(arg), exact);
+                    try self.write(a, out, self.get(arg), exact);
                 }
                 try out.append(a, ']');
             },
@@ -162,19 +209,19 @@ pub const Table = struct {
                 try out.appendSlice(a, "fn(");
                 for (t.args, 0..) |arg, i| {
                     if (i != 0) try out.appendSlice(a, ", ");
-                    try self.write(out, self.get(arg), exact);
+                    try self.write(a, out, self.get(arg), exact);
                 }
                 if (t.variadic) try out.appendSlice(a, if (t.args.len != 0) ", ..." else "...");
                 try out.appendSlice(a, ") -> ");
-                try self.write(out, self.get(t.ret), exact);
+                try self.write(a, out, self.get(t.ret), exact);
             },
         }
     }
 
-    /// The type as a user would write it.
-    pub fn format(self: *const Table, id: TypeId) ![]const u8 {
+    /// The type as a user would write it, in memory from `a`.
+    pub fn format(self: *const Table, a: Allocator, id: TypeId) ![]const u8 {
         var out: std.ArrayList(u8) = .empty;
-        try self.write(&out, self.get(id), false);
+        try self.write(a, &out, self.get(id), false);
         return out.items;
     }
 
@@ -184,7 +231,13 @@ pub const Table = struct {
     /// `fn(int, str) -> bool`, `fn(...) -> void`. Names are basic types;
     /// `unknown` and `any` mean "not checked".
     pub fn parse(self: *Table, text: []const u8) ParseError!TypeId {
-        var p = Parser{ .table = self, .text = text };
+        return self.parseIn(self.arena, text);
+    }
+
+    /// parse(), with its scratch lists in `alloc` (a checker's arena: the
+    /// checkers of a project prepare on several threads)
+    pub fn parseIn(self: *Table, alloc: Allocator, text: []const u8) ParseError!TypeId {
+        var p = Parser{ .table = self, .alloc = alloc, .text = text };
         const id = try p.one();
         p.skip();
         if (p.pos != text.len) return error.BadType;
@@ -193,6 +246,7 @@ pub const Table = struct {
 
     const Parser = struct {
         table: *Table,
+        alloc: Allocator,
         text: []const u8,
         pos: usize = 0,
         depth: u32 = 0,
@@ -223,7 +277,7 @@ pub const Table = struct {
                 var variadic = false;
                 if (!self.eat(")")) {
                     while (true) {
-                        if (self.eat("...")) variadic = true else try params.append(self.table.arena, try self.one());
+                        if (self.eat("...")) variadic = true else try params.append(self.alloc, try self.one());
                         if (self.eat(")")) break;
                         if (!self.eat(",")) return error.BadType;
                     }
@@ -233,7 +287,7 @@ pub const Table = struct {
             } else if (self.eat("[")) {
                 var args: std.ArrayList(TypeId) = .empty;
                 while (true) {
-                    try args.append(self.table.arena, try self.one());
+                    try args.append(self.alloc, try self.one());
                     if (self.eat("]")) break;
                     if (!self.eat(",")) return error.BadType;
                 }
@@ -363,6 +417,117 @@ pub const Inputs = struct {
 
 const Role = enum(u8) { none, literal, container, binary, unary, call, index, member, type_name, type_args, optional };
 
+/// One side of an operator row: a type, `T` (the same type throughout the
+/// row) or `any`
+const Slot = struct {
+    kind: enum { exact, bound, any },
+    id: TypeId = UNKNOWN,
+};
+
+const Row = struct { left: Slot, right: Slot, result: Slot };
+
+const DeclKind = enum(u8) { none, variable, function, structure };
+
+/// The types a types() rule's options mention, as ids: the same for every
+/// file, so read once (interning takes the table's lock) and shared
+pub const Options = struct {
+    /// Per entry of Inputs.literals
+    literal_types: []const TypeId,
+    coerce: std.ArrayList([2]TypeId),
+    builtin_types: std.StringHashMapUnmanaged(TypeId),
+    /// Operator text -> its rows
+    operators: std.StringHashMapUnmanaged(OperatorRows),
+    bool_type: TypeId,
+    void_type: TypeId,
+    nil_type: TypeId,
+    int_type: TypeId,
+    str_type: TypeId,
+};
+
+/// The option texts Options are read from
+pub const OptionTexts = struct {
+    literal_types: []const []const u8,
+    operators: []const Operator,
+    basic: []const []const u8,
+    coerce: []const [2][]const u8,
+    builtins: []const [2][]const u8,
+    names: Names,
+};
+
+pub fn readOptions(table: *Table, arena: Allocator, texts: OptionTexts) Table.ParseError!Options {
+    for (texts.basic) |name| _ = try table.basic(name);
+    const literal_types = try arena.alloc(TypeId, texts.literal_types.len);
+    for (literal_types, texts.literal_types) |*slot, text| slot.* = try table.parseIn(arena, text);
+    var coerce: std.ArrayList([2]TypeId) = .empty;
+    for (texts.coerce) |pair| try coerce.append(arena, .{ try table.parseIn(arena, pair[0]), try table.parseIn(arena, pair[1]) });
+    var builtin_types: std.StringHashMapUnmanaged(TypeId) = .empty;
+    for (texts.builtins) |pair| try builtin_types.put(arena, pair[0], try table.parseIn(arena, pair[1]));
+
+    // The operator table: rows grouped by operator, types resolved
+    const Lists = struct { binary: std.ArrayList(Row) = .empty, unary: std.ArrayList(Row) = .empty };
+    var lists: std.StringArrayHashMapUnmanaged(Lists) = .empty;
+    for (texts.operators) |op| {
+        const row = Row{
+            .left = if (op.left.len == 0) .{ .kind = .any } else try rowSlot(table, arena, op.left),
+            .right = try rowSlot(table, arena, op.right),
+            .result = try rowSlot(table, arena, op.result),
+        };
+        const entry = try lists.getOrPutValue(arena, op.op, .{});
+        try (if (op.left.len == 0) &entry.value_ptr.unary else &entry.value_ptr.binary).append(arena, row);
+    }
+    var operators: std.StringHashMapUnmanaged(OperatorRows) = .empty;
+    var it = lists.iterator();
+    while (it.next()) |entry| {
+        const binary = entry.value_ptr.binary.items;
+        const unary = entry.value_ptr.unary.items;
+        try operators.put(arena, entry.key_ptr.*, .{
+            .binary = binary,
+            .unary = unary,
+            .common_binary = commonResult(binary),
+            .common_unary = commonResult(unary),
+        });
+    }
+
+    return .{
+        .literal_types = literal_types,
+        .coerce = coerce,
+        .builtin_types = builtin_types,
+        .operators = operators,
+        .bool_type = try table.basic(texts.names.bool),
+        .void_type = try table.basic(texts.names.void),
+        .nil_type = try table.basic(texts.names.nil),
+        .int_type = try table.basic(texts.names.int),
+        .str_type = try table.basic(texts.names.str),
+    };
+}
+
+fn rowSlot(table: *Table, arena: Allocator, text: []const u8) Table.ParseError!Slot {
+    if (std.mem.eql(u8, text, "T")) return .{ .kind = .bound };
+    if (std.mem.eql(u8, text, "any")) return .{ .kind = .any };
+    return .{ .kind = .exact, .id = try table.parseIn(arena, text) };
+}
+
+/// What every row results in, if they agree (`==` is always bool,
+/// whatever the operands); unknown otherwise.
+fn commonResult(rows: []const Row) TypeId {
+    var result: ?TypeId = null;
+    for (rows) |row| {
+        if (row.result.kind != .exact) return UNKNOWN;
+        if (result != null and result.? != row.result.id) return UNKNOWN;
+        result = row.result.id;
+    }
+    return result orelse UNKNOWN;
+}
+
+/// The rows of one operator, binary and unary, and what each kind results
+/// in when its rows all agree
+const OperatorRows = struct {
+    binary: []const Row,
+    unary: []const Row,
+    common_binary: TypeId,
+    common_unary: TypeId,
+};
+
 const UNSET: TypeId = std.math.maxInt(TypeId);
 const BUSY: TypeId = UNSET - 1;
 
@@ -378,24 +543,26 @@ pub const Checker = struct {
     others: []const *Checker = &.{},
     problems: std.ArrayList(Problem) = .empty,
 
+    // Per node, arrays rather than maps: the checker looks nodes up all the time
     role: []Role = &.{},
-    literal_type: []TypeId = &.{},
-    /// Container node -> its constructor's name
-    container_name: std.AutoHashMapUnmanaged(u32, []const u8) = .empty,
+    /// By role: a literal's type; a container's index in in.containers; a
+    /// member access's index in in.members (not set for other nodes)
+    aux: []u32 = &.{},
     /// Memo per node: its type as an expression (UNSET / BUSY while unknown)
     expr: []TypeId = &.{},
-    /// Memo per symbol of `names`
-    symbol: []TypeId = &.{},
-    /// Name node -> the declaration it belongs to
-    variable_of: std.AutoHashMapUnmanaged(u32, u32) = .empty,
-    function_of: std.AutoHashMapUnmanaged(u32, u32) = .empty,
-    struct_of: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+    /// Memo per node: the type it stands for as a type expression (each is
+    /// evaluated, and reports its problems, once)
+    type_expr: []TypeId = &.{},
+    /// Name node -> the declaration it belongs to (decl_node is set where decl_kind isn't none)
+    decl_kind: []DeclKind = &.{},
+    decl_node: []u32 = &.{},
     is_function: []bool = &.{},
-    member_of: std.AutoHashMapUnmanaged(u32, scopes.Member) = .empty,
+    /// Memo per symbol of `names`: its type as a value, and the type it
+    /// stands for when written as a type (`int`, `Point`)
+    symbol: []TypeId = &.{},
+    named: []TypeId = &.{},
     coerce: std.ArrayList([2]TypeId) = .empty,
     builtin_types: std.StringHashMapUnmanaged(TypeId) = .empty,
-    /// Type expressions already evaluated (each reports its problems once)
-    type_nodes: std.AutoHashMapUnmanaged(u32, TypeId) = .empty,
     /// Scope node -> the types of the fields declared in it
     field_types: std.AutoHashMapUnmanaged(u32, []const TypeId) = .empty,
     /// Scope node -> the symbols of the variables declared directly in it
@@ -403,6 +570,14 @@ pub const Checker = struct {
     fields_grouped: bool = false,
     /// The computation in progress in this file (0 = none)
     frame: u64 = 0,
+    /// The depth bookkeeping of the thread this checker works on: the
+    /// table's while every file's checker works on one, its own when files
+    /// are checked in parallel (see independent())
+    work: *Work,
+    /// The option types, shared by every file's checker
+    opts: *const Options,
+    /// Operator text -> its rows
+    operators: std.StringHashMapUnmanaged(OperatorRows) = .empty,
     bool_type: TypeId = UNKNOWN,
     void_type: TypeId = UNKNOWN,
     nil_type: TypeId = UNKNOWN,
@@ -415,23 +590,29 @@ pub const Checker = struct {
         const n = self.tree.nodes.len;
         self.role = try self.arena.alloc(Role, n);
         @memset(self.role, .none);
-        self.literal_type = try self.arena.alloc(TypeId, n);
+        self.aux = try self.arena.alloc(u32, n);
         self.expr = try self.arena.alloc(TypeId, n);
         @memset(self.expr, UNSET);
+        self.type_expr = try self.arena.alloc(TypeId, n);
+        @memset(self.type_expr, UNSET);
+        self.decl_kind = try self.arena.alloc(DeclKind, n);
+        @memset(self.decl_kind, .none);
+        self.decl_node = try self.arena.alloc(u32, n);
         self.is_function = try self.arena.alloc(bool, n);
         @memset(self.is_function, false);
 
-        for (self.in.literals) |lit| {
-            const id = try self.table.parse(lit.type);
+        const opts = self.opts;
+        for (self.in.literals, 0..) |lit, i| {
+            const id = opts.literal_types[i];
             for (lit.nodes) |node| {
                 self.role[node] = .literal;
-                self.literal_type[node] = id;
+                self.aux[node] = id;
             }
         }
-        for (self.in.containers) |container| {
+        for (self.in.containers, 0..) |container, i| {
             for (container.nodes) |node| {
                 self.role[node] = .container;
-                try self.container_name.put(self.arena, node, container.name);
+                self.aux[node] = @intCast(i);
             }
         }
         inline for (.{
@@ -441,35 +622,45 @@ pub const Checker = struct {
         }) |pair| {
             for (@field(self.in, pair[0])) |node| self.role[node] = pair[1];
         }
-        for (self.in.members) |m| {
+        for (self.in.members, 0..) |m, i| {
             self.role[m.node] = .member;
-            try self.member_of.put(self.arena, m.node, m);
+            self.aux[m.node] = @intCast(i);
         }
         for (self.in.variables) |node| {
             const name = self.child(node, self.in.labels.name);
-            try self.variable_of.put(self.arena, if (name != NONE) name else node, node);
+            self.declare(if (name != NONE) name else node, .variable, node);
         }
         for (self.in.functions) |node| {
             self.is_function[node] = true;
             const name = self.child(node, self.in.labels.name);
-            if (name != NONE) try self.function_of.put(self.arena, name, node);
+            if (name != NONE) self.declare(name, .function, node);
         }
         for (self.in.structs) |node| {
             const name = self.child(node, self.in.labels.name);
-            if (name != NONE) try self.struct_of.put(self.arena, name, node);
+            if (name != NONE) self.declare(name, .structure, node);
         }
-        self.table.void_name = self.in.names.void;
-        for (self.in.basic) |name| _ = try self.table.basic(name);
-        for (self.in.coerce) |pair| try self.coerce.append(self.arena, .{ try self.table.parse(pair[0]), try self.table.parse(pair[1]) });
-        for (self.in.builtins) |pair| try self.builtin_types.put(self.arena, pair[0], try self.table.parse(pair[1]));
+        // What the options say, read once for every file (see readOptions)
+        self.coerce = opts.coerce;
+        self.builtin_types = opts.builtin_types;
+        self.operators = opts.operators;
+        self.bool_type = opts.bool_type;
+        self.void_type = opts.void_type;
+        self.nil_type = opts.nil_type;
+        self.int_type = opts.int_type;
+        self.str_type = opts.str_type;
 
+        self.named = try self.arena.alloc(TypeId, self.names.symbols.items.len);
+        @memset(self.named, UNSET);
         self.symbol = try self.arena.alloc(TypeId, self.names.symbols.items.len);
         @memset(self.symbol, UNSET);
-        self.bool_type = try self.table.basic(self.in.names.bool);
-        self.void_type = try self.table.basic(self.in.names.void);
-        self.nil_type = try self.table.basic(self.in.names.nil);
-        self.int_type = try self.table.basic(self.in.names.int);
-        self.str_type = try self.table.basic(self.in.names.str);
+    }
+
+    /// Record the declaration a name node belongs to; the first kind given
+    /// wins (variables, then functions, then structs).
+    fn declare(self: *Checker, name: u32, kind: DeclKind, decl: u32) void {
+        if (self.decl_kind[name] != .none) return;
+        self.decl_kind[name] = kind;
+        self.decl_node[name] = decl;
     }
 
     // ── Tree helpers ──
@@ -486,17 +677,59 @@ pub const Checker = struct {
         return NONE;
     }
 
+    /// The children of `node` labelled `field`, as a new slice.
     fn children(self: *const Checker, node: u32, field: u8) Error![]const u32 {
-        var out: std.ArrayList(u32) = .empty;
-        if (field == 0) return out.items;
-        const t = self.tree;
-        const stop = t.end(node);
-        var c = node + 1;
-        while (c < stop) : (c = t.end(c)) {
-            if (t.nodes[c].fieldId() == field) try out.append(self.arena, c);
-        }
-        return out.items;
+        var count: usize = 0;
+        var it = self.labelled(node, field);
+        while (it.next()) |_| count += 1;
+        const out = try self.arena.alloc(u32, count);
+        it = self.labelled(node, field);
+        for (out) |*slot| slot.* = it.next().?;
+        return out;
     }
+
+    const Labelled = struct {
+        tree: *const Tree,
+        field: u8,
+        at: u32,
+        stop: u32,
+
+        fn next(self: *Labelled) ?u32 {
+            if (self.field == 0) return null;
+            while (self.at < self.stop) {
+                const c = self.at;
+                self.at = self.tree.end(c);
+                if (self.tree.nodes[c].fieldId() == self.field) return c;
+            }
+            return null;
+        }
+    };
+
+    /// The children of `node` labelled `field`, one at a time, without allocating.
+    fn labelled(self: *const Checker, node: u32, field: u8) Labelled {
+        return .{ .tree = self.tree, .field = field, .at = node + 1, .stop = self.tree.end(node) };
+    }
+
+    /// A list of types that lives on the stack unless it grows long
+    const TypeList = struct {
+        small: [16]TypeId = undefined,
+        len: usize = 0,
+        large: std.ArrayList(TypeId) = .empty,
+
+        fn append(self: *TypeList, arena: Allocator, id: TypeId) Error!void {
+            if (self.large.items.len == 0 and self.len < self.small.len) {
+                self.small[self.len] = id;
+                self.len += 1;
+                return;
+            }
+            if (self.large.items.len == 0) try self.large.appendSlice(arena, self.small[0..self.len]);
+            try self.large.append(arena, id);
+        }
+
+        fn items(self: *const TypeList) []const TypeId {
+            return if (self.large.items.len != 0) self.large.items else self.small[0..self.len];
+        }
+    };
 
     fn report(self: *Checker, kind: ProblemKind, node: u32, comptime fmt: []const u8, args: anytype) Error!void {
         try self.problems.append(self.arena, .{ .kind = kind, .node = node, .message = try std.fmt.allocPrint(self.arena, fmt, args), .frame = self.frame });
@@ -506,10 +739,10 @@ pub const Checker = struct {
 
     /// Start a computation, or put it off (null) if it is too deep.
     fn begin(self: *Checker, what: What, id: u32) Error!?Frame {
-        const work = &self.table.work;
+        const work = self.work;
         if (work.depth >= MAX_DEPTH) {
             work.overflows += 1;
-            try work.pending.append(self.table.arena, .{ .checker = self, .what = what, .id = id });
+            try work.pending.append(work.arena, .{ .checker = self, .what = what, .id = id });
             return null;
         }
         work.depth += 1;
@@ -522,7 +755,7 @@ pub const Checker = struct {
     /// result must not be remembered, and what it reported is taken back
     /// (it runs again later, and what it saw may have been incomplete).
     fn finish(self: *Checker, frame: Frame) bool {
-        const work = &self.table.work;
+        const work = self.work;
         work.depth -= 1;
         const whole = work.overflows == frame.mark;
         if (!whole) {
@@ -549,7 +782,14 @@ pub const Checker = struct {
     /// A type asked for from the top (not from inside another computation):
     /// whatever was put off on the way is worked out, then it is asked again.
     pub fn settled(self: *Checker, what: What, id: u32) Error!TypeId {
-        const work = &self.table.work;
+        // Already worked out: most questions from the top are
+        const memo = switch (what) {
+            .expr => self.expr[id],
+            .symbol => self.symbol[id],
+            .type_node => self.type_expr[id],
+        };
+        if (memo != UNSET and memo != BUSY) return memo;
+        const work = self.work;
         while (true) {
             const mark = work.overflows;
             const result = try self.run(what, id);
@@ -565,18 +805,42 @@ pub const Checker = struct {
     }
 
     fn show(self: *const Checker, id: TypeId) Error![]const u8 {
-        return self.table.format(id);
+        // In this file's memory: other files may be spelling types meanwhile
+        return self.table.format(self.arena, id);
     }
 
     // ── Types written in the source ──
 
     /// The type a type expression stands for.
     pub fn typeNode(self: *Checker, node: u32) Error!TypeId {
-        if (self.type_nodes.get(node)) |id| return id;
+        if (self.type_expr[node] != UNSET) return self.type_expr[node];
         const frame = try self.begin(.type_node, node) orelse return UNKNOWN;
         const id = try self.computeTypeNode(node);
-        if (self.finish(frame)) try self.type_nodes.put(self.arena, node, id);
+        if (self.finish(frame)) self.type_expr[node] = id;
         return id;
+    }
+
+    /// The type a name written as a type stands for, if it names one: a
+    /// declared type, or a basic one. Worked out once per name, not per use.
+    fn namedType(self: *Checker, sym: ?u32, text: []const u8) Error!?TypeId {
+        if (sym) |s| {
+            if (self.named[s] != UNSET) return self.named[s];
+        }
+        const mark = self.work.overflows;
+        const found: ?TypeId = blk: {
+            // A declared type (here or imported) wins over a basic one of the same name
+            if (sym) |s| {
+                const d = self.table.get(try self.symbolType(s));
+                if (d.kind == .generic and std.mem.eql(u8, d.name, "type") and d.args.len == 1) break :blk d.args[0];
+            }
+            if (std.mem.eql(u8, text, "unknown") or std.mem.eql(u8, text, "any")) break :blk UNKNOWN;
+            break :blk self.table.basicNamed(text);
+        };
+        // (not if part of the answer was put off: see begin())
+        if (sym) |s| {
+            if (found != null and self.work.overflows == mark) self.named[s] = found.?;
+        }
+        return found;
     }
 
     fn computeTypeNode(self: *Checker, node: u32) Error!TypeId {
@@ -584,14 +848,7 @@ pub const Checker = struct {
         switch (self.role[node]) {
             .type_name => {
                 const text = t.text(node);
-                // A declared type (here or imported) wins over a basic one of the same name
-                if (self.names.symbolOf(node)) |sym| {
-                    const declared = try self.symbolType(sym);
-                    const d = self.table.get(declared);
-                    if (d.kind == .generic and std.mem.eql(u8, d.name, "type") and d.args.len == 1) return d.args[0];
-                }
-                if (std.mem.eql(u8, text, "unknown") or std.mem.eql(u8, text, "any")) return UNKNOWN;
-                if (self.isBasic(text)) return self.table.basic(text);
+                if (try self.namedType(self.names.symbolOf(node), text)) |id| return id;
                 // A use that resolved to nothing is already an undefined name
                 const already_reported = self.names.symbolOf(node) == null and std.sort.binarySearch(u32, self.in.uses, node, struct {
                     fn order(a: u32, b: u32) std.math.Order {
@@ -603,9 +860,10 @@ pub const Checker = struct {
             },
             .type_args => {
                 const base = self.child(node, self.in.labels.base);
-                var args: std.ArrayList(TypeId) = .empty;
-                for (try self.children(node, self.in.labels.args)) |arg| try args.append(self.arena, try self.typeNode(arg));
-                return self.table.generic(if (base != NONE) t.text(base) else "", args.items);
+                var args: TypeList = .{};
+                var it = self.labelled(node, self.in.labels.args);
+                while (it.next()) |arg| try args.append(self.arena, try self.typeNode(arg));
+                return self.table.generic(if (base != NONE) t.text(base) else "", args.items());
             },
             .optional => {
                 const inner = node + 1;
@@ -619,10 +877,6 @@ pub const Checker = struct {
                 return UNKNOWN;
             },
         }
-    }
-
-    fn isBasic(self: *const Checker, name: []const u8) bool {
-        return self.table.index.contains(name) and self.table.get(self.table.index.get(name).?).kind == .basic;
     }
 
     // ── Symbols ──
@@ -657,27 +911,31 @@ pub const Checker = struct {
 
     fn declarationType(self: *Checker, name_node: u32) Error!TypeId {
         const labels = self.in.labels;
-        if (self.variable_of.get(name_node)) |decl| {
-            const annotation = self.child(decl, labels.type);
-            if (annotation != NONE) return self.typeNode(annotation);
-            const value = self.child(decl, labels.value);
-            if (value != NONE) return self.typeOf(value);
-            return UNKNOWN;
+        const decl = self.decl_node[name_node];
+        switch (self.decl_kind[name_node]) {
+            .variable => {
+                const annotation = self.child(decl, labels.type);
+                if (annotation != NONE) return self.typeNode(annotation);
+                const value = self.child(decl, labels.value);
+                if (value != NONE) return self.typeOf(value);
+                return UNKNOWN;
+            },
+            .function => return self.functionType(decl),
+            .structure => {
+                const declared = try self.table.nominal(self.tree.text(name_node), self.file, name_node);
+                return self.table.generic("type", &.{declared});
+            },
+            .none => return UNKNOWN,
         }
-        if (self.function_of.get(name_node)) |decl| return self.functionType(decl);
-        if (self.struct_of.get(name_node)) |_| {
-            const declared = try self.table.nominal(self.tree.text(name_node), self.file, name_node);
-            return self.table.generic("type", &.{declared});
-        }
-        return UNKNOWN;
     }
 
     fn functionType(self: *Checker, decl: u32) Error!TypeId {
         const labels = self.in.labels;
-        var params: std.ArrayList(TypeId) = .empty;
-        for (try self.children(decl, labels.params)) |param| try params.append(self.arena, try self.parameterType(param));
+        var params: TypeList = .{};
+        var it = self.labelled(decl, labels.params);
+        while (it.next()) |param| try params.append(self.arena, try self.parameterType(param));
         const returns = self.child(decl, labels.returns);
-        return self.table.function(params.items, if (returns != NONE) try self.typeNode(returns) else UNKNOWN, false);
+        return self.table.function(params.items(), if (returns != NONE) try self.typeNode(returns) else UNKNOWN, false);
     }
 
     /// A parameter is a variable declaration (with its own annotation) or a bare name.
@@ -713,11 +971,12 @@ pub const Checker = struct {
         const t = self.tree;
         const labels = self.in.labels;
         switch (self.role[node]) {
-            .literal => return self.literal_type[node],
+            .literal => return self.aux[node],
             .container => {
                 // name[T]: T is what the first item is; the others must fit it
                 var item_type: TypeId = UNKNOWN;
-                for (try self.children(node, labels.items)) |item| {
+                var items = self.labelled(node, labels.items);
+                while (items.next()) |item| {
                     const it = try self.typeOf(item);
                     if (item_type == UNKNOWN) {
                         item_type = it;
@@ -727,7 +986,7 @@ pub const Checker = struct {
                         try self.report(.mismatch, item, "expected an item of type '{s}', got '{s}'", .{ try self.show(item_type), try self.show(it) });
                     }
                 }
-                return self.table.generic(self.container_name.get(node).?, &.{item_type});
+                return self.table.generic(self.in.containers[self.aux[node]].name, &.{item_type});
             },
             .binary => {
                 const left = self.child(node, labels.left);
@@ -775,7 +1034,7 @@ pub const Checker = struct {
                 return result;
             },
             .member => {
-                const m = self.member_of.get(node).?;
+                const m = self.in.members[self.aux[node]];
                 // Already resolved by name (an enum's member, a module's)
                 if (self.names.symbolOf(node)) |sym| return self.symbolType(sym);
                 const owner_id = try self.typeOf(m.target);
@@ -797,60 +1056,51 @@ pub const Checker = struct {
         return UNKNOWN;
     }
 
-    /// Does a row's type text accept `actual`? `bound` is what `T` stands for.
-    fn rowAccepts(self: *Checker, text: []const u8, actual: TypeId, bound: *TypeId) Error!bool {
-        if (std.mem.eql(u8, text, "any")) return true;
+    /// Does a row's slot accept `actual`? `bound` is what `T` stands for.
+    fn accepts(self: *const Checker, s: Slot, actual: TypeId, bound: *TypeId) bool {
         if (actual == UNKNOWN) return true;
-        if (std.mem.eql(u8, text, "T")) {
-            if (bound.* == UNKNOWN) {
-                bound.* = actual;
-                return true;
-            }
-            if (self.assignable(actual, bound.*)) return true;
-            if (self.assignable(bound.*, actual)) {
-                bound.* = actual;
-                return true;
-            }
-            return false;
+        switch (s.kind) {
+            .any => return true,
+            .exact => return self.assignable(actual, s.id),
+            .bound => {
+                if (bound.* == UNKNOWN) {
+                    bound.* = actual;
+                    return true;
+                }
+                if (self.assignable(actual, bound.*)) return true;
+                if (self.assignable(bound.*, actual)) {
+                    bound.* = actual;
+                    return true;
+                }
+                return false;
+            },
         }
-        const wanted = self.table.parse(text) catch return false;
-        return self.assignable(actual, wanted);
     }
 
     fn operator(self: *Checker, node: u32, op: []const u8, l: TypeId, r: TypeId, unary: bool) Error!TypeId {
-        var any_row = false;
-        for (self.in.operators) |row| {
-            if (!std.mem.eql(u8, row.op, op) or (row.left.len == 0) != unary) continue;
-            any_row = true;
+        // An operator the table says nothing about is not judged
+        const entry = self.operators.get(op) orelse return UNKNOWN;
+        const rows = if (unary) entry.unary else entry.binary;
+        if (rows.len == 0) return UNKNOWN;
+        const common = if (unary) entry.common_unary else entry.common_binary;
+        for (rows) |row| {
             var bound: TypeId = UNKNOWN;
-            if (!unary and !try self.rowAccepts(row.left, l, &bound)) continue;
-            if (!try self.rowAccepts(row.right, r, &bound)) continue;
+            if (!unary and !self.accepts(row.left, l, &bound)) continue;
+            if (!self.accepts(row.right, r, &bound)) continue;
             // With an operand unknown, the row may not be the right one
-            if ((!unary and l == UNKNOWN) or r == UNKNOWN) return self.commonResult(op, unary);
-            if (std.mem.eql(u8, row.result, "T")) return bound;
-            return self.table.parse(row.result) catch UNKNOWN;
+            if ((!unary and l == UNKNOWN) or r == UNKNOWN) return common;
+            return switch (row.result.kind) {
+                .bound => bound,
+                .exact => row.result.id,
+                .any => UNKNOWN,
+            };
         }
-        if (!any_row) return UNKNOWN; // an operator the table says nothing about
         if (unary) {
             try self.report(.operator, node, "operator '{s}' cannot be applied to '{s}'", .{ op, try self.show(r) });
         } else {
             try self.report(.operator, node, "operator '{s}' cannot be applied to '{s}' and '{s}'", .{ op, try self.show(l), try self.show(r) });
         }
-        return self.commonResult(op, unary);
-    }
-
-    /// What every row of an operator results in, if they agree (`==` is
-    /// always bool, whatever the operands).
-    fn commonResult(self: *Checker, op: []const u8, unary: bool) TypeId {
-        var result: ?TypeId = null;
-        for (self.in.operators) |row| {
-            if (!std.mem.eql(u8, row.op, op) or (row.left.len == 0) != unary) continue;
-            if (std.mem.eql(u8, row.result, "T")) return UNKNOWN;
-            const id = self.table.parse(row.result) catch return UNKNOWN;
-            if (result != null and result.? != id) return UNKNOWN;
-            result = id;
-        }
-        return result orelse UNKNOWN;
+        return common;
     }
 
     fn call(self: *Checker, node: u32) Error!TypeId {
@@ -918,16 +1168,16 @@ pub const Checker = struct {
         if (!self.fields_grouped) {
             self.fields_grouped = true;
             for (self.names.symbols.items, 0..) |s, i| {
-                if (s.scope == NONE or s.node == NONE or !self.variable_of.contains(s.node)) continue;
+                if (s.scope == NONE or s.node == NONE or self.decl_kind[s.node] != .variable) continue;
                 const entry = try self.fields_of.getOrPutValue(self.arena, s.scope, .empty);
                 try entry.value_ptr.append(self.arena, @intCast(i));
             }
         }
-        const mark = self.table.work.overflows;
+        const mark = self.work.overflows;
         if (self.fields_of.get(scope)) |fields| {
             for (fields.items) |i| try out.append(self.arena, try self.symbolType(i));
         }
-        if (self.table.work.overflows == mark) try self.field_types.put(self.arena, scope, out.items);
+        if (self.work.overflows == mark) try self.field_types.put(self.arena, scope, out.items);
         return out.items;
     }
 
@@ -977,6 +1227,18 @@ pub const Checker = struct {
     }
 
     // ── The checks ──
+
+    /// Work out everything another file can ask this one about: the type of
+    /// every symbol, and the fields of every declared type. Afterwards the
+    /// other files only read this checker, so each file's check() and
+    /// complete() can run on a thread of its own (with a Work of its own).
+    pub fn prepareExports(self: *Checker) Error!void {
+        for (0..self.symbol.len) |i| _ = try self.settled(.symbol, @intCast(i));
+        for (self.in.structs) |decl| {
+            const name = self.child(decl, self.in.labels.name);
+            if (name != NONE) _ = try self.fieldTypes(name);
+        }
+    }
 
     pub fn check(self: *Checker) Error!void {
         const t = self.tree;
@@ -1051,11 +1313,28 @@ pub const Checker = struct {
     pub fn complete(self: *Checker) Error!void {
         for (0..self.symbol.len) |i| _ = try self.settled(.symbol, @intCast(i));
         // Backwards: children before their parents, so nothing goes deep
-        var node = self.expr.len;
+        const t = self.tree;
+        var node: u32 = @intCast(self.expr.len);
         while (node > 0) {
             node -= 1;
-            if (self.role[node] == .type_name or self.role[node] == .type_args or self.role[node] == .optional) continue;
-            _ = try self.settled(.expr, @intCast(node));
+            if (self.expr[node] != UNSET) continue;
+            const role = self.role[node];
+            if (role == .type_name or role == .type_args or role == .optional) continue;
+            // Most nodes are no expression at all: what compute() would
+            // conclude, without the bookkeeping
+            if (role == .none and self.names.symbolOf(node) == null) {
+                const inner = node + 1;
+                if (inner >= t.end(node) or t.end(inner) != t.end(node)) {
+                    self.expr[node] = UNKNOWN;
+                    continue;
+                }
+                const wrapped = self.expr[inner];
+                if (wrapped != UNSET and wrapped != BUSY) {
+                    self.expr[node] = wrapped;
+                    continue;
+                }
+            }
+            _ = try self.settled(.expr, node);
         }
     }
 
@@ -1063,7 +1342,7 @@ pub const Checker = struct {
     /// one, else as an expression), without computing anything.
     pub fn known(self: *const Checker, node: u32) TypeId {
         if (node >= self.expr.len) return UNKNOWN;
-        if (self.type_nodes.get(node)) |id| return id;
+        if (self.type_expr[node] != UNSET) return self.type_expr[node];
         const id = self.expr[node];
         return if (id == UNSET or id == BUSY) UNKNOWN else id;
     }

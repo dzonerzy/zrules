@@ -112,8 +112,8 @@ fn inside(args: pyoz.Args(struct {
 })) pyoz.Signature(?Rule, "Rule") {
     const a = args.value;
     return .{ .value = makeRule(.inside, .{
-        .{ "selector", a.selector }, .{ "within", a.within },   .{ "stop_at", a.stop_at },
-        .{ "message", a.message },   .{ "code", a.code },       .{ "severity", a.severity },
+        .{ "selector", a.selector }, .{ "within", a.within }, .{ "stop_at", a.stop_at },
+        .{ "message", a.message },   .{ "code", a.code },     .{ "severity", a.severity },
     }) };
 }
 
@@ -185,14 +185,14 @@ fn scopes(args: pyoz.Args(struct {
 })) pyoz.Signature(?Rule, "Rule") {
     const a = args.value;
     return .{ .value = makeRule(.scopes, .{
-        .{ "scope", a.scope },               .{ "define", a.define },           .{ "use", a.use },
-        .{ "define_outer", a.define_outer }, .{ "hoist", a.hoist },             .{ "builtins", a.builtins },
-        .{ "ordered", a.ordered },           .{ "namespace", a.namespace },     .{ "on_undefined", a.on_undefined },
-        .{ "on_redefine", a.on_redefine },   .{ "on_unused", a.on_unused },     .{ "on_shadow", a.on_shadow },
-        .{ "messages", a.messages },         .{ "codes", a.codes },             .{ "after", a.after },
-        .{ "on_unresolved", a.on_unresolved }, .{ "members", a.members },             .{ "member_labels", a.member_labels },
-        .{ "on_no_member", a.on_no_member },   .{ "imports", a.imports },             .{ "import_all", a.import_all },
-        .{ "import_labels", a.import_labels }, .{ "exports", a.exports },             .{ "on_no_module", a.on_no_module },
+        .{ "scope", a.scope },                 .{ "define", a.define },       .{ "use", a.use },
+        .{ "define_outer", a.define_outer },   .{ "hoist", a.hoist },         .{ "builtins", a.builtins },
+        .{ "ordered", a.ordered },             .{ "namespace", a.namespace }, .{ "on_undefined", a.on_undefined },
+        .{ "on_redefine", a.on_redefine },     .{ "on_unused", a.on_unused }, .{ "on_shadow", a.on_shadow },
+        .{ "messages", a.messages },           .{ "codes", a.codes },         .{ "after", a.after },
+        .{ "on_unresolved", a.on_unresolved }, .{ "members", a.members },     .{ "member_labels", a.member_labels },
+        .{ "on_no_member", a.on_no_member },   .{ "imports", a.imports },     .{ "import_all", a.import_all },
+        .{ "import_labels", a.import_labels }, .{ "exports", a.exports },     .{ "on_no_module", a.on_no_module },
         .{ "on_no_export", a.on_no_export },   .{ "outside", a.outside },
     }) };
 }
@@ -235,14 +235,14 @@ fn types(args: pyoz.Args(struct {
 })) pyoz.Signature(?Rule, "Rule") {
     const a = args.value;
     return .{ .value = makeRule(.types, .{
-        .{ "basic", a.basic },           .{ "coerce", a.coerce },         .{ "literals", a.literals },
-        .{ "type_names", a.type_names }, .{ "type_args", a.type_args },   .{ "optional", a.optional },
-        .{ "variables", a.variables },   .{ "functions", a.functions },   .{ "structs", a.structs },
-        .{ "binary", a.binary },         .{ "unary", a.unary },           .{ "calls", a.calls },
-        .{ "index", a.index },           .{ "assigns", a.assigns },       .{ "returns", a.returns },
-        .{ "conditions", a.conditions }, .{ "operators", a.operators },   .{ "builtins", a.builtins },
-        .{ "labels", a.labels },         .{ "namespace", a.namespace },   .{ "severity", a.severity },
-        .{ "codes", a.codes },           .{ "ignore", a.ignore },         .{ "containers", a.containers },
+        .{ "basic", a.basic },           .{ "coerce", a.coerce },       .{ "literals", a.literals },
+        .{ "type_names", a.type_names }, .{ "type_args", a.type_args }, .{ "optional", a.optional },
+        .{ "variables", a.variables },   .{ "functions", a.functions }, .{ "structs", a.structs },
+        .{ "binary", a.binary },         .{ "unary", a.unary },         .{ "calls", a.calls },
+        .{ "index", a.index },           .{ "assigns", a.assigns },     .{ "returns", a.returns },
+        .{ "conditions", a.conditions }, .{ "operators", a.operators }, .{ "builtins", a.builtins },
+        .{ "labels", a.labels },         .{ "namespace", a.namespace }, .{ "severity", a.severity },
+        .{ "codes", a.codes },           .{ "ignore", a.ignore },       .{ "containers", a.containers },
         .{ "names", a.names },
     }) };
 }
@@ -272,13 +272,13 @@ fn flow(args: pyoz.Args(struct {
 })) pyoz.Signature(?Rule, "Rule") {
     const a = args.value;
     return .{ .value = makeRule(.flow, .{
-        .{ "sequences", a.sequences },           .{ "functions", a.functions },                 .{ "branches", a.branches },
-        .{ "arms", a.arms },                     .{ "otherwise", a.otherwise },                 .{ "loops", a.loops },
-        .{ "forever", a.forever },               .{ "at_least_once", a.at_least_once },         .{ "exits", a.exits },
-        .{ "breaks", a.breaks },                 .{ "continues", a.continues },                 .{ "must_return", a.must_return },
-        .{ "variables", a.variables },           .{ "assigns", a.assigns },                     .{ "labels", a.labels },
-        .{ "namespace", a.namespace },           .{ "on_unreachable", a.on_unreachable },       .{ "on_missing_return", a.on_missing_return },
-        .{ "on_unassigned", a.on_unassigned },   .{ "messages", a.messages },                   .{ "codes", a.codes },
+        .{ "sequences", a.sequences },         .{ "functions", a.functions },           .{ "branches", a.branches },
+        .{ "arms", a.arms },                   .{ "otherwise", a.otherwise },           .{ "loops", a.loops },
+        .{ "forever", a.forever },             .{ "at_least_once", a.at_least_once },   .{ "exits", a.exits },
+        .{ "breaks", a.breaks },               .{ "continues", a.continues },           .{ "must_return", a.must_return },
+        .{ "variables", a.variables },         .{ "assigns", a.assigns },               .{ "labels", a.labels },
+        .{ "namespace", a.namespace },         .{ "on_unreachable", a.on_unreachable }, .{ "on_missing_return", a.on_missing_return },
+        .{ "on_unassigned", a.on_unassigned }, .{ "messages", a.messages },             .{ "codes", a.codes },
     }) };
 }
 
@@ -634,9 +634,7 @@ const AnalysisData = struct {
         // A scratch spelling: the table's arena is only for interned types
         var buf: [512]u8 = undefined;
         var fixed = std.heap.FixedBufferAllocator.init(&buf);
-        var scratch = share.table;
-        scratch.arena = fixed.allocator();
-        const text = scratch.format(id) catch return py.PyUnicode_FromStringAndSize("...", 3);
+        const text = share.table.format(fixed.allocator(), id) catch return py.PyUnicode_FromStringAndSize("...", 3);
         return py.PyUnicode_FromStringAndSize(text.ptr, @intCast(text.len));
     }
 
@@ -1486,7 +1484,7 @@ const Rules = struct {
         }
 
         var codes: [type_problem_kinds][]const u8 = .{
-            "type-mismatch", "bad-operand", "arity",        "bad-argument", "not-callable",
+            "type-mismatch", "bad-operand", "arity",         "bad-argument", "not-callable",
             "no-field",      "bad-return",  "bad-condition", "unknown-type", "not-indexable",
         };
         var ignore: [type_problem_kinds]bool = @splat(false);
@@ -2023,6 +2021,8 @@ const Rules = struct {
             /// import brings in names instead
             local: u32,
             wildcard: bool,
+            /// The file the module is, once resolved (NONE: no such file)
+            target: u32 = NONE,
         };
 
         /// What a scopes() rule matched in this file, kept between the two
@@ -2034,7 +2034,7 @@ const Rules = struct {
             defs: []const scopes_mod.Definition,
             uses: []const u32,
             members: []const scopes_mod.Member,
-            imports: []const Import,
+            imports: []Import,
             /// Top-level names this file offers to the others -> defining node
             exports: std.StringHashMapUnmanaged(u32) = .empty,
         };
@@ -2167,32 +2167,103 @@ const Rules = struct {
         }
 
         /// Every node matching any of the selectors, in source order, once.
-        fn matchAll(self: *Run, selectors: []const Selector) ![]u32 {
-            // One selector that is just a name or a label: its candidates are the answer
-            if (selectors.len == 1 and selectors[0].compounds.len == 1) {
-                const only = selectors[0].compounds[0];
-                const plain = only.attrs.len == 0 and only.nots.len == 0 and only.has.len == 0 and only.nth == 0 and !only.last;
-                if (plain and (only.rules == null or only.field == 0)) return @constCast(try self.arena.dupe(u32, try self.candidates(only)));
+        fn matchAll(self: *Run, selectors: []const Selector) ![]const u32 {
+            if (selectors.len == 0) return &.{};
+            // Each selector's matches are in source order: merge them
+            var merged = try self.matchOne(&selectors[0]);
+            for (selectors[1..]) |*s| {
+                const more = try self.matchOne(s);
+                if (more.len == 0) continue;
+                if (merged.len == 0) {
+                    merged = more;
+                    continue;
+                }
+                const out = try self.arena.alloc(u32, merged.len + more.len);
+                var i: usize = 0;
+                var j: usize = 0;
+                var n: usize = 0;
+                while (i < merged.len or j < more.len) {
+                    const take_left = j == more.len or (i < merged.len and merged[i] <= more[j]);
+                    const node = if (take_left) merged[i] else more[j];
+                    if (take_left) i += 1 else j += 1;
+                    // A node both select is listed once
+                    if (n != 0 and out[n - 1] == node) continue;
+                    out[n] = node;
+                    n += 1;
+                }
+                merged = out[0..n];
             }
+            // Read-only: it may be a slice of the node index itself
+            return merged;
+        }
+
+        /// The nodes one selector matches, in source order.
+        fn matchOne(self: *Run, s: *const Selector) ![]const u32 {
+            const last = s.compounds[s.compounds.len - 1];
+            // `a > b` where b names no rule or label (`x > :not(y)`): every
+            // node would be a candidate; the children of the a's are enough
+            if (last.rules == null and last.field == 0 and last.relation == .child) {
+                const parent_part = s.compounds[s.compounds.len - 2];
+                if (parent_part.rules != null or parent_part.field != 0) return self.matchChildren(s, parent_part);
+            }
+            const found = try self.candidates(last);
+            // Just a name or a label: its candidates are the answer
+            if (s.compounds.len == 1 and isPlain(last) and (last.rules == null or last.field == 0)) return found;
+            const out = try self.arena.alloc(u32, found.len);
+            var n: usize = 0;
+            // `a > b` with both parts a plain name or label (`let_stmt > .name`),
+            // the commonest shape by far: two table lookups per candidate
+            if (s.compounds.len == 2 and last.relation == .child and isPlain(last) and isPlain(s.compounds[0])) {
+                const t = self.tree;
+                const parent_part = s.compounds[0];
+                for (found) |node| {
+                    if (!plainMatches(t, last, node)) continue;
+                    const parent = t.parents[node];
+                    if (parent == NONE or !plainMatches(t, parent_part, parent)) continue;
+                    out[n] = node;
+                    n += 1;
+                }
+                return out[0..n];
+            }
+            for (found) |node| {
+                if (!s.matches(self.tree, node, null)) continue;
+                out[n] = node;
+                n += 1;
+            }
+            return out[0..n];
+        }
+
+        /// The children of the parent part's candidates that match `s`, in source order.
+        fn matchChildren(self: *Run, s: *const Selector, parent_part: selector.Compound) ![]const u32 {
+            const t = self.tree;
             var out: std.ArrayList(u32) = .empty;
             var in_order = true;
-            for (selectors) |*s| {
-                for (try self.candidates(s.compounds[s.compounds.len - 1])) |node| {
-                    if (!s.matches(self.tree, node, null)) continue;
-                    if (out.items.len != 0 and out.items[out.items.len - 1] >= node) in_order = false;
-                    try out.append(self.arena, node);
+            for (try self.candidates(parent_part)) |parent| {
+                if (!plainMatches(t, parent_part, parent)) continue;
+                const stop = t.end(parent);
+                var child = parent + 1;
+                while (child < stop) : (child = t.end(child)) {
+                    if (!s.matches(t, child, null)) continue;
+                    // A parent inside another one's child comes later in the list
+                    if (out.items.len != 0 and out.items[out.items.len - 1] >= child) in_order = false;
+                    try out.append(self.arena, child);
                 }
             }
-            if (in_order) return out.items;
-            std.sort.pdq(u32, out.items, {}, std.sort.asc(u32));
-            var kept: usize = 0;
-            for (out.items) |node| {
-                if (kept == 0 or out.items[kept - 1] != node) {
-                    out.items[kept] = node;
-                    kept += 1;
-                }
-            }
-            return out.items[0..kept];
+            if (!in_order) std.sort.pdq(u32, out.items, {}, std.sort.asc(u32));
+            return out.items;
+        }
+
+        /// A part that is only a name and/or a label
+        fn isPlain(c: selector.Compound) bool {
+            return c.attrs.len == 0 and c.nots.len == 0 and c.has.len == 0 and c.nth == 0 and !c.last;
+        }
+
+        fn plainMatches(t: *const Tree, c: selector.Compound, node: u32) bool {
+            const flat = t.nodes[node];
+            if (c.field != 0 and flat.fieldId() != c.field) return false;
+            const rules = c.rules orelse return true;
+            const id = flat.ruleId();
+            return id < rules.len and rules[id];
         }
 
         /// What a types() rule matched in this file, for the checker. `r`
@@ -2296,17 +2367,33 @@ const Rules = struct {
             const after = try self.matchAll(sr.after);
             const uses = try self.matchAll(sr.use);
 
+            // Every list is in source order: merge them in one pass
             var defs: std.ArrayList(scopes_mod.Definition) = .empty;
-            for (inner) |node| {
-                // Listed in both: the outer form wins
-                if (std.sort.binarySearch(u32, outer, node, orderU32) == null) try defs.append(self.arena, .{ .node = node });
-            }
-            for (outer) |node| try defs.append(self.arena, .{ .node = node, .outer = true });
-            for (defs.items) |*d| {
-                d.hoisted = std.sort.binarySearch(u32, hoisted, d.node, orderU32) != null;
-                const parent = t.parents[d.node];
-                const whole = parent != NONE and std.sort.binarySearch(u32, after, d.node, orderU32) != null;
-                d.visible_from = t.nodes[if (whole) parent else d.node].text_end;
+            try defs.ensureTotalCapacity(self.arena, inner.len + outer.len);
+            {
+                var i: usize = 0;
+                var o: usize = 0;
+                var h: usize = 0;
+                var a: usize = 0;
+                while (i < inner.len or o < outer.len) {
+                    // Listed in both: the outer form wins
+                    const take_outer = i == inner.len or (o < outer.len and outer[o] <= inner[i]);
+                    const node = if (take_outer) outer[o] else inner[i];
+                    if (take_outer) {
+                        if (i < inner.len and inner[i] == node) i += 1;
+                        o += 1;
+                    } else i += 1;
+                    while (h < hoisted.len and hoisted[h] < node) h += 1;
+                    while (a < after.len and after[a] < node) a += 1;
+                    const parent = t.parents[node];
+                    const whole = parent != NONE and a < after.len and after[a] == node;
+                    defs.appendAssumeCapacity(.{
+                        .node = node,
+                        .outer = take_outer,
+                        .hoisted = h < hoisted.len and hoisted[h] == node,
+                        .visible_from = t.nodes[if (whole) parent else node].text_end,
+                    });
+                }
             }
 
             // Imports define names too: the imported names (or their
@@ -2359,7 +2446,8 @@ const Rules = struct {
                 try imports.append(self.arena, import);
             }
 
-            std.sort.pdq(scopes_mod.Definition, defs.items, {}, struct {
+            // Imports added definitions after the merged, sorted ones
+            if (imports.items.len != 0) std.sort.pdq(scopes_mod.Definition, defs.items, {}, struct {
                 fn lt(_: void, a: scopes_mod.Definition, b: scopes_mod.Definition) bool {
                     return a.node < b.node;
                 }
@@ -2406,13 +2494,24 @@ const Rules = struct {
                 .imports = imports.items,
             };
             if (self.in_project and (sr.imports.len != 0 or sr.import_all.len != 0)) {
-                // What the other files can import: the top-level definitions
-                const top = try scopes_mod.analyze(self.arena, t, scope_nodes, defs.items, &.{}, &.{}, &.{}, &.{}, .{});
-                for (top.symbols.items) |sym| {
-                    if (!sym.exported or sym.node == NONE) continue;
-                    if (sr.exports.len != 0 and !self.anyMatches(sr.exports, sym.node)) continue;
-                    const entry = try input.exports.getOrPut(self.arena, sym.name);
-                    if (!entry.found_existing) entry.value_ptr.* = sym.node;
+                // What the other files can import: the top-level definitions,
+                // those with at most one scope above the scope they are in
+                const is_scope = try self.arena.alloc(bool, t.nodes.len);
+                @memset(is_scope, false);
+                for (scope_nodes) |s| is_scope[s] = true;
+                for (defs.items) |d| {
+                    // An outer definition belongs one scope further out
+                    const allowed: u32 = if (d.outer) 2 else 1;
+                    var above: u32 = 0;
+                    var p = t.parents[d.node];
+                    while (p != NONE and above <= allowed) : (p = t.parents[p]) {
+                        if (is_scope[p]) above += 1;
+                    }
+                    if (above > allowed) continue;
+                    if (sr.exports.len != 0 and !self.anyMatches(sr.exports, d.node)) continue;
+                    // The first definition of a name is the one exported
+                    const entry = try input.exports.getOrPut(self.arena, t.text(d.node));
+                    if (!entry.found_existing) entry.value_ptr.* = d.node;
                 }
             }
             try self.scope_inputs.append(self.arena, input);
@@ -2420,10 +2519,18 @@ const Rules = struct {
 
         const FinishError = error{ OutOfMemory, PythonError };
 
+        /// Which file each import of a scopes() rule refers to. Done before
+        /// the files are finished in parallel: a resolver is Python code.
+        fn resolveImports(self: *Run, index: usize, link: *const Link, file: usize) error{PythonError}!void {
+            for (self.scope_inputs.items[index].imports) |*import| {
+                import.target = (try link.resolve(file, self.tree.text(import.module))) orelse NONE;
+            }
+        }
+
         /// Second pass of a scopes() rule: resolve the imports against the
         /// other files' exports (`link`; null when checking one file alone),
         /// then resolve every name.
-        fn finishScopes(self: *Run, index: usize, link: ?*const Link, file: usize) FinishError!void {
+        fn finishScopes(self: *Run, index: usize, link: ?*const Link) FinishError!void {
             const t = self.tree;
             const input = &self.scope_inputs.items[index];
             const sr = input.rule;
@@ -2438,9 +2545,8 @@ const Rules = struct {
             for (input.imports) |import| {
                 const module_text = t.text(import.module);
                 // One file alone: what a module offers is unknown, so is
-                // what a wildcard import brings in
-                const target: ?u32 = if (link) |l| try l.resolve(file, module_text) else null;
-                const other = target orelse {
+                // what a wildcard import brings in (resolveImports() found the files)
+                const other = if (link != null and import.target != NONE) import.target else {
                     if (link != null) try import_problems.append(self.arena, .{ .kind = .no_module, .node = import.module });
                     if (import.wildcard) assume_defined = true;
                     continue;
@@ -2854,6 +2960,110 @@ const Rules = struct {
         input: []const u8,
     };
 
+    /// One more thread per this many nodes, up to MAX_THREADS: measured on
+    /// 26K to 1.6M-node projects. Fewer, and starting threads costs more
+    /// than they save; more, and they contend for the allocator and memory.
+    const NODES_PER_THREAD = 25_000;
+    const MAX_THREADS = 8;
+
+    /// Run `job.run(i)` for every file i: on several threads (with the GIL
+    /// released) when there are several files and enough work, else here.
+    /// False if a job failed (out of memory).
+    fn forEachFile(n: usize, total_nodes: usize, job: anytype) bool {
+        const threads = @min(n, std.Thread.getCpuCount() catch 1, MAX_THREADS, total_nodes / NODES_PER_THREAD);
+        if (threads <= 1) {
+            for (0..n) |i| job.run(i) catch return false;
+            return true;
+        }
+        const Shared = struct {
+            job: @TypeOf(job),
+            n: usize,
+            next: std.atomic.Value(usize) = .init(0),
+            failed: std.atomic.Value(bool) = .init(false),
+
+            fn work(self: *@This()) void {
+                while (!self.failed.load(.monotonic)) {
+                    const i = self.next.fetchAdd(1, .monotonic);
+                    if (i >= self.n) return;
+                    self.job.run(i) catch self.failed.store(true, .monotonic);
+                }
+            }
+
+            fn all(self: *@This(), wanted: usize) void {
+                var handles: [MAX_THREADS]std.Thread = undefined;
+                var started: usize = 0;
+                for (0..wanted - 1) |_| {
+                    // Fewer threads than asked for is fine: this one works too
+                    handles[started] = std.Thread.spawn(.{}, work, .{self}) catch break;
+                    started += 1;
+                }
+                self.work();
+                for (handles[0..started]) |h| h.join();
+            }
+        };
+        var shared = Shared{ .job = job, .n = n };
+        pyoz.allowThreads(Shared.all, .{ &shared, threads });
+        return !shared.failed.load(.monotonic);
+    }
+
+    const PrepareJob = struct {
+        files: []const File,
+        rules: usize,
+
+        fn run(self: PrepareJob, i: usize) !void {
+            const r = self.files[i].run;
+            try r.buildIndex();
+            for (0..self.rules) |index| try r.check(index);
+        }
+    };
+
+    const NamesJob = struct {
+        files: []const File,
+        link: ?*const Link,
+
+        fn run(self: NamesJob, i: usize) !void {
+            const r = self.files[i].run;
+            for (0..r.scope_inputs.items.len) |index| try r.finishScopes(index, self.link);
+        }
+    };
+
+    const PrepareTypesJob = struct {
+        files: []const File,
+        checkers: []const *types_mod.Checker,
+        rule: *const TypeRule,
+
+        fn run(self: PrepareTypesJob, i: usize) !void {
+            const checker = self.checkers[i];
+            checker.in = try self.files[i].run.typeInputs(self.rule, self.files[i].data.typed_result);
+            checker.prepare() catch return error.OutOfMemory;
+        }
+    };
+
+    const TypesJob = struct {
+        checkers: []const *types_mod.Checker,
+
+        fn run(self: TypesJob, i: usize) !void {
+            const checker = self.checkers[i];
+            // The depth bookkeeping of this thread, not the shared one
+            const work = try checker.arena.create(types_mod.Work);
+            work.* = .{ .arena = checker.arena };
+            checker.work = work;
+            try checker.check();
+            try checker.complete();
+        }
+    };
+
+    const FlowJob = struct {
+        files: []const File,
+        rules: []const CompiledRule,
+
+        fn run(self: FlowJob, i: usize) !void {
+            for (self.rules) |r| {
+                if (r.flow) |fr| try self.files[i].run.runFlow(fr);
+            }
+        }
+    };
+
     /// Check `sources` together. `keys` names them (null: one file checked
     /// alone, whose imports can't be followed). On success `out` receives a
     /// new reference to each file's Analysis.
@@ -2875,11 +3085,13 @@ const Rules = struct {
             opened += 1;
         }
 
+        // The native passes below touch only their own file (and read what
+        // the others have finished): they run in parallel, without the GIL
+        var total_nodes: usize = 0;
+        for (files) |f| total_nodes += f.run.tree.nodes.len;
+
         // Pass 1: the structural rules, and what each file defines and exports
-        for (files) |f| {
-            f.run.buildIndex() catch return oomObject() != null;
-            for (0..state.rules.items.len) |i| f.run.check(i) catch return oomObject() != null;
-        }
+        if (!forEachFile(files.len, total_nodes, PrepareJob{ .files = files, .rules = state.rules.items.len })) return oomObject() != null;
 
         // Pass 2: names, with the imports resolved against the other files
         const runs = allocator.alloc(*Run, files.len) catch return oomObject() != null;
@@ -2905,22 +3117,20 @@ const Rules = struct {
             const entry = link.by_text.getOrPut(allocator, ptr[0..@intCast(len)]) catch return oomObject() != null;
             if (!entry.found_existing) entry.value_ptr.* = @intCast(i);
         }
-        for (files, 0..) |f, file_index| {
-            for (0..f.run.scope_inputs.items.len) |index| {
-                f.run.finishScopes(index, if (keys != null) &link else null, file_index) catch |e| switch (e) {
-                    error.OutOfMemory => return oomObject() != null,
-                    error.PythonError => return false,
-                };
+        // Which file each import names (a resolver is Python: here, with the GIL)
+        if (keys != null) {
+            for (files, 0..) |f, file_index| {
+                for (0..f.run.scope_inputs.items.len) |index| {
+                    f.run.resolveImports(index, &link, file_index) catch return false;
+                }
             }
         }
+        if (!forEachFile(files.len, total_nodes, NamesJob{ .files = files, .link = if (keys != null) &link else null })) return oomObject() != null;
 
-        // Types and flow, once every file's names are resolved
+        // Types, once every file's names are resolved (the files' checkers
+        // work out each other's types: one thread), and flow
         if (!runTypes(state, files)) return false;
-        for (files) |f| {
-            for (state.rules.items) |r| {
-                if (r.flow) |fr| f.run.runFlow(fr) catch return oomObject() != null;
-            }
-        }
+        if (!forEachFile(files.len, total_nodes, FlowJob{ .files = files, .rules = state.rules.items })) return oomObject() != null;
 
         // Pass 3: the parts that call into Python, and the diagnostics
         var key_share: ?*KeyShare = null;
@@ -2964,7 +3174,25 @@ const Rules = struct {
         };
         share.table = types_mod.Table.init(share.arena.allocator()) catch return oomObject() != null;
 
-        const checkers = share.arena.allocator().alloc(*types_mod.Checker, files.len) catch return oomObject() != null;
+        const share_arena = share.arena.allocator();
+        const checkers = share_arena.alloc(*types_mod.Checker, files.len) catch return oomObject() != null;
+        // The types the options mention: read once for every file
+        const literal_texts = share_arena.alloc([]const u8, tr.literals.len) catch return oomObject() != null;
+        for (literal_texts, tr.literals) |*slot, lit| slot.* = lit.type;
+        const opts = share_arena.create(types_mod.Options) catch return oomObject() != null;
+        // (`fn(int)` in the options returns this)
+        share.table.void_name = tr.names.void;
+        opts.* = types_mod.readOptions(&share.table, share_arena, .{
+            .literal_types = literal_texts,
+            .operators = tr.operators,
+            .basic = tr.basic,
+            .coerce = tr.coerce,
+            .builtins = tr.builtins,
+            .names = tr.names,
+        }) catch |e| {
+            if (e == error.OutOfMemory) _ = py.c.PyErr_NoMemory() else raise(py.PyExc_ValueError(), "types(): a type in the rule's options could not be read", .{});
+            return false;
+        };
         for (files, 0..) |f, i| {
             const run = f.run;
             // The scopes() rule whose names are typed
@@ -2983,28 +3211,32 @@ const Rules = struct {
                 });
                 return false;
             };
-            const inputs = run.typeInputs(tr, r) catch return oomObject() != null;
             const checker = run.arena.create(types_mod.Checker) catch return oomObject() != null;
             checker.* = .{
                 .arena = run.arena,
                 .table = &share.table,
                 .tree = run.tree,
                 .names = &run.scope_results.items[r].result,
-                .in = inputs,
+                .in = .{ .labels = tr.labels },
                 .file = @intCast(i),
                 .others = checkers,
+                .work = &share.table.work,
+                .opts = opts,
             };
             checkers[i] = checker;
-            checker.prepare() catch |e| {
-                if (e == error.OutOfMemory) _ = py.c.PyErr_NoMemory() else raise(py.PyExc_ValueError(), "types(): a type in the rule's options could not be read", .{});
-                return false;
-            };
             f.data.checker = checker;
             f.data.typed_result = r;
         }
-        // Every checker exists before any runs: they ask each other about imported names
-        for (checkers) |checker| checker.check() catch return oomObject() != null;
-        for (checkers) |checker| checker.complete() catch return oomObject() != null;
+        var total_nodes: usize = 0;
+        for (files) |f| total_nodes += f.run.tree.nodes.len;
+        // Each file's inputs and tables, in parallel (the options' types were
+        // read when the rules were compiled: reading them again can't fail)
+        if (!forEachFile(files.len, total_nodes, PrepareTypesJob{ .files = files, .checkers = checkers, .rule = tr })) return oomObject() != null;
+        // Every checker exists before any runs: they ask each other about
+        // imported names. First, on this thread, what each file offers the
+        // others; then every file checks its own code, in parallel.
+        for (checkers) |checker| checker.prepareExports() catch return oomObject() != null;
+        if (!forEachFile(files.len, total_nodes, TypesJob{ .checkers = checkers })) return oomObject() != null;
 
         for (files, checkers) |f, checker| {
             for (checker.problems.items) |p| {

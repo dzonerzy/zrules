@@ -43,10 +43,10 @@ Every option, class member and diagnostic code is listed in the [reference](docs
 ## Installation
 
 ```bash
-pip install zrules
+pip install zrules-py
 ```
 
-Requires `zgram-py` 0.2 or newer. Wheels cover CPython 3.10+ on x86_64 Linux and Windows.
+Like every zsuite package, it is named `<name>-py` on PyPI; the module is `zrules` (`import zrules`). It installs `zgram-py` 0.2.1 or newer with it. Wheels cover CPython 3.10+ on x86_64 Linux and Windows.
 
 ## Selectors
 
@@ -355,11 +355,16 @@ Each rule visits only the nodes its selector can end on, found through an index 
 | 4 structural rules | 0.4 ms |
 | 19 structural rules | 0.9 ms |
 | `scopes()` resolving 8,000 definitions and 16,000 uses (34,000 nodes) | 1.3 ms |
-| `scopes()` + `types()` on a typed program: 896 KB, 260,000 nodes, 20,000 typed declarations with calls | 31 ms |
-| the same kind of program with `flow()` added (773 KB, 265,000 nodes) | 39 ms, 4.5 ms of it flow |
-| `analyze_project()` on 8,000 small files importing one another, with types | 80 ms |
+| a typed program of 773 KB and 265,000 nodes (zgram parses it in 4.6 ms): `scopes()` | 3.1 ms |
+| the same with `types()` | 11 ms |
+| the same with `types()` and `flow()` | 15 ms |
+| the Lua checker of [examples/lua](examples/lua) on 830 real files (7.2 MB, 740,000 nodes; parsing them takes 36 ms) | 50 ms |
+| `analyze_project()` on 480 typed modules importing one another (1.6 million nodes) | 35 ms, against 69 ms for the files one after another |
+| `analyze_project()` on 8,000 small files importing one another | 47 ms |
 
 `Symbol` objects are created only when asked for (`symbols`, `resolve()`, `at()`), so `check()` pays nothing for them.
+
+`analyze_project()` checks the files in parallel: the structural rules, names and flow of each file on a thread of its own, and types in two steps (first, one thread works out what every file offers the others; then each file checks its own code on its own thread). The Python lock is released meanwhile. Up to 8 threads are used, one per 25,000 nodes: fewer for small projects, where starting threads would cost more than it saves. Rules written in Python still run one file after another.
 
 ## Example: a whole language
 

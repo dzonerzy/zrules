@@ -108,12 +108,20 @@ pub const Selector = struct {
         for (c.has) |h| {
             var chain: [MAX_COMPOUNDS]u32 = undefined;
             var found = false;
-            var inner = node + 1;
-            while (inner < stop and !found) : (inner += 1) {
-                if (!h.sel.matches(t, inner, chain[0..h.sel.compounds.len])) continue;
-                // The whole match must lie inside the node
-                const top = chain[0];
-                found = top > node and top < stop and (!h.child or t.parents[top] == node);
+            if (h.child and h.sel.compounds.len == 1) {
+                // `:has(> x)`: only the children can match, not the whole subtree
+                var child = node + 1;
+                while (child < stop and !found) : (child = t.end(child)) {
+                    found = h.sel.matches(t, child, chain[0..1]);
+                }
+            } else {
+                var inner = node + 1;
+                while (inner < stop and !found) : (inner += 1) {
+                    if (!h.sel.matches(t, inner, chain[0..h.sel.compounds.len])) continue;
+                    // The whole match must lie inside the node
+                    const top = chain[0];
+                    found = top > node and top < stop and (!h.child or t.parents[top] == node);
+                }
             }
             if (!found) return false;
         }

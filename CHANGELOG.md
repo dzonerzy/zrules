@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`on_unresolved=`** for `scopes()`: a function that decides about names that resolve to nothing.
 - **`scopes()`:** name resolution with nested scopes, outer definitions, hoisting, builtins, separate namespaces, and diagnostics for undefined, redefined, unused and shadowed names.
 - **Member access:** `scopes(members=...)` resolves `target.name` in the scope the target names (enums, modules, static members) and reports missing members.
+- **Several files:** `scopes(imports=..., import_all=...)` and `rules.analyze_project(files, resolve=None)` resolve imports between files (module imports with qualified access, named imports with aliases, wildcard imports, re-exports, cycles) and report missing modules and names. `Project` gives each file's `Analysis` and follows a name to its definition with `origin()`.
 - **`rules.analyze()`** returns an `Analysis` with the diagnostics and the symbol table: `symbols`, `resolve(node)`, `at(offset)`.
 - **Custom rules:** `@rules.rule(selector)`, `rules.add()` and `custom()` call a Python function with the node and a context (`error`, `warning`, `note`, `resolve`).
 - **`examples/tiny`:** a small language whose static errors are all found by zrules.

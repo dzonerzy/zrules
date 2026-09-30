@@ -5,8 +5,12 @@ import zgram
 
 GRAMMAR = r"""
 program     = ws (body:stmt ws)*                                      -> Program
-@silent stmt = funcdef | enum_def | while_stmt | return_stmt | break_stmt | let_stmt | expr_stmt
-enum_def    = 'enum' kw ws name:ident ws '{' ws (members:ident ws)* (stmt ws)* '}'   -> Enum
+@silent stmt = import_stmt | from_stmt | funcdef | enum_def | while_stmt | return_stmt | break_stmt | let_stmt | expr_stmt
+import_stmt = 'import' kw ws module:ident (ws 'as' kw ws alias:ident)? ws ';'   -> Import
+from_stmt   = 'from' kw ws module:ident ws 'import' kw ws (star | names:import_name (ws ',' ws names:import_name)*) ws ';'  -> FromImport
+import_name = ident (ws 'as' kw ws alias:ident)?
+star        = '*'
+enum_def    ='enum' kw ws name:ident ws '{' ws (members:ident ws)* (stmt ws)* '}'   -> Enum
 funcdef     = 'fn' kw ws name:ident ws '(' ws (params:ident (ws ',' ws params:ident)*)? ws ')' ws body:block  -> FuncDef
 block       = '{' ws (stmt ws)* '}'                                   -> list
 while_stmt  = 'while' kw ws cond:expr ws body:block                   -> While
@@ -22,7 +26,7 @@ call        = name:ident ws '(' ws (args:expr (ws ',' ws args:expr)*)? ws ')'  -
 number      = [0-9]+                                                  -> int
 ident       = !keyword [a-z_]+                                        -> Name
 addop       = [+\-]                                                   -> str
-@silent keyword = ('fn' | 'enum' | 'while' | 'return' | 'break' | 'let') kw
+@silent keyword = ('fn' | 'enum' | 'while' | 'return' | 'break' | 'let' | 'import' | 'from' | 'as') kw
 @silent kw  = ![a-z_]
 @silent ws  = [ \t\n]*
 """

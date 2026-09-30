@@ -39,8 +39,23 @@ pub const Symbol = struct {
     /// The scope node this name stands for (an outer definition names the
     /// scope its node is in); NONE if it has no members
     owns: u32 = NONE,
+    /// Defined at the top level of its file: other files can import it
+    exported: bool = false,
+    /// Where it really comes from, for a name imported from another file:
+    /// that file's index and the defining node there; NONE otherwise
+    origin_file: u32 = NONE,
+    origin_node: u32 = NONE,
+    /// For the local name of an imported module: that file's index
+    module: u32 = NONE,
     /// Nodes that use it, in source order
     uses: []const u32 = &.{},
+};
+
+/// A name another file defines, made visible in this one (`from m import *`)
+pub const External = struct {
+    name: []const u8,
+    file: u32,
+    node: u32,
 };
 
 /// `target.name`: the access node and its two labelled children
@@ -50,7 +65,7 @@ pub const Member = struct {
     name: u32,
 };
 
-pub const ProblemKind = enum { undefined, redefined, unused, shadowed, no_member };
+pub const ProblemKind = enum { undefined, redefined, unused, shadowed, no_member, no_module, no_export };
 
 pub const Problem = struct {
     kind: ProblemKind,
@@ -58,6 +73,8 @@ pub const Problem = struct {
     /// redefined / shadowed: the earlier definition's node (NONE for a builtin).
     /// no_member: the node defining the name that lacks the member.
     other: u32 = NONE,
+    /// no_member / no_export: the name of what lacks it, when `other` can't say
+    owner: []const u8 = "",
 };
 
 pub const Options = struct {
@@ -66,13 +83,19 @@ pub const Options = struct {
     ordered: bool = true,
     report_unused: bool = false,
     report_shadowed: bool = false,
+    /// Names may come from somewhere this analysis can't see (a wildcard
+    /// import of a file that isn't available): don't report undefined ones
+    assume_defined: bool = false,
 };
 
 pub const Result = struct {
-    symbols: []Symbol,
-    problems: []Problem,
+    symbols: std.ArrayList(Symbol),
+    problems: std.ArrayList(Problem),
     /// Per node: the index into symbols of the name it defines or uses, or NONE
-    by_node: []const u32,
+    by_node: []u32,
+    /// Member accesses whose target has no members known here (the caller
+    /// may know better: the target may be an imported module)
+    open_members: []const Member = &.{},
 
     pub fn symbolOf(self: *const Result, node: u64) ?u32 {
         if (node >= self.by_node.len or self.by_node[node] == NONE) return null;
@@ -94,6 +117,7 @@ pub fn analyze(
     uses: []const u32,
     members: []const Member,
     builtins: []const []const u8,
+    externals: []const External,
     options: Options,
 ) !Result {
     const n_nodes = t.nodes.len;
@@ -131,6 +155,14 @@ pub fn analyze(
         entry.value_ptr.* = @intCast(symbols.items.len);
         try symbols.append(arena, .{ .name = name, .node = NONE, .scope = NONE, .hoisted = true });
     }
+    try symbols.ensureUnusedCapacity(arena, externals.len);
+    for (externals) |ext| {
+        const id = try names.getOrPutValue(arena, ext.name, names.count());
+        const entry = try table.getOrPut(arena, key(NONE, id.value_ptr.*));
+        if (entry.found_existing) continue; // the first import of a name wins
+        entry.value_ptr.* = @intCast(symbols.items.len);
+        try symbols.append(arena, .{ .name = ext.name, .node = NONE, .scope = NONE, .hoisted = true, .origin_file = ext.file, .origin_node = ext.node });
+    }
 
     // The name of a member access is looked up in its target's scope, not
     // through the scopes around it
@@ -157,7 +189,15 @@ pub fn analyze(
         }
         entry.value_ptr.* = @intCast(symbols.items.len);
         by_node[d.node] = entry.value_ptr.*;
-        try symbols.append(arena, .{ .name = name, .node = d.node, .scope = scope, .hoisted = d.hoisted, .visible_from = d.visible_from, .owns = owns });
+        try symbols.append(arena, .{
+            .name = name,
+            .node = d.node,
+            .scope = scope,
+            .hoisted = d.hoisted,
+            .visible_from = d.visible_from,
+            .owns = owns,
+            .exported = scope == NONE or above[scope] == NONE,
+        });
         if (options.report_shadowed) {
             var outer_scope = scope;
             while (outer_scope != NONE) {
@@ -177,7 +217,7 @@ pub fn analyze(
     for (uses) |use| {
         if (is_definition[use] or is_member_name[use]) continue;
         const id = names.get(t.text(use)) orelse {
-            try problems.append(arena, .{ .kind = .undefined, .node = use });
+            if (!options.assume_defined) try problems.append(arena, .{ .kind = .undefined, .node = use });
             continue;
         };
         const own_scope = above[use];
@@ -197,13 +237,14 @@ pub fn analyze(
             is_resolved_use[use] = true;
             use_count[index + 1] += 1;
             resolved += 1;
-        } else {
+        } else if (!options.assume_defined) {
             try problems.append(arena, .{ .kind = .undefined, .node = use });
         }
     }
 
     // Member accesses, innermost first (in `a.b.c` the node for `a.b` comes
     // after the node for the whole, so go backwards)
+    var open_members: std.ArrayList(Member) = .empty;
     var mi = members.len;
     while (mi > 0) {
         mi -= 1;
@@ -212,7 +253,10 @@ pub fn analyze(
         if (target == NONE) continue; // unknown or already reported
         const owner = symbols.items[target];
         // Not something with members known here (a variable, say): not ours to judge
-        if (owner.owns == NONE) continue;
+        if (owner.owns == NONE) {
+            try open_members.append(arena, m);
+            continue;
+        }
         const found: ?u32 = if (names.get(t.text(m.name))) |id| table.get(key(owner.owns, id)) else null;
         if (found) |index| {
             by_node[m.name] = index;
@@ -245,5 +289,5 @@ pub fn analyze(
         }
     }
 
-    return .{ .symbols = symbols.items, .problems = problems.items, .by_node = by_node };
+    return .{ .symbols = symbols, .problems = problems, .by_node = by_node, .open_members = open_members.items };
 }

@@ -162,7 +162,7 @@ class TestSymbols:
 
         classes = {
             name: make_dataclass(name, fields.split())
-            for name, fields in dict(Program="body", FuncDef="name params body", While="cond body", Return="value", Break="", Let="name value", BinOp="left op right", Call="name args", Name="text", Enum="name members", Member="target name").items()
+            for name, fields in dict(Program="body", FuncDef="name params body", While="cond body", Return="value", Break="", Let="name value", BinOp="left op right", Call="name args", Name="text", Enum="name members", Member="target name", Import="module alias", FromImport="module names").items()
         }
         import conftest
 

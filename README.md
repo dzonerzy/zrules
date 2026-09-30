@@ -140,6 +140,45 @@ scopes(
 
 A name defined with `define_outer` stands for the scope its node is in, and that scope's own definitions are its members. In `target.name`, `name` is looked up among the members of what `target` resolves to, and nowhere else: `Color.blue` is reported as `'Color' has no member 'blue'` (`on_no_member`, code `no-member`), and `red` alone stays undefined. Chains (`a.b.c`) resolve left to right. When the target is something without members known to the scopes, a variable for instance, the access is left alone. `member_labels=("object", "attr")` changes the two labels.
 
+### Several files: imports
+
+Tell `scopes()` which nodes are import statements, and check the files together:
+
+```python
+rules = Rules(parser, [scopes(
+    ...,
+    members="Member",
+    imports=("Import", "FromImport"),        # import statements
+    import_all="FromImport:has(> star)",     # those that bring in every name
+)])
+
+project = rules.analyze_project({
+    "util": "fn helper(x) { return x; }",
+    "main": "import util;\nfrom util import helper as h;\nutil.helper; h(1);",
+})
+project.ok                       # no file has an error
+project.diagnostics              # {"util": [...], "main": [...]}
+project.file("main")             # that file's Analysis
+```
+
+An import statement is read through three labels, `module`, `names` and `alias` (`import_labels=` renames them):
+
+| Statement | Children | Effect |
+|---|---|---|
+| `import util;` | `module` | defines `util`; `util.helper` looks `helper` up among what the file exports |
+| `import util as u;` | `module`, `alias` | the same under the name `u` |
+| `from util import a, b;` | `module`, several `names` | defines `a` and `b`, each bound to the definition in `util` |
+| `from util import a as x;` | a `names` node holding the name and an `alias` | defines `x` |
+| `from util import *;` | `module` (matched by `import_all`) | every exported name is visible; local definitions win |
+
+- **Exports** are a file's top-level definitions; `exports="FuncDef > .name"` narrows them. Imported names are re-exported.
+- **Which file a module is:** by default the module's text (quotes removed) is the file's key. `resolve=function` overrides that: `function(module_text, importing_key)` returns a key or `None`, which is where search paths and relative imports go.
+- **Diagnostics:** `module 'x' not found` (`on_no_module`, code `no-module`), `module 'util' has no 'x'` (`on_no_export`, code `no-export`), and `'util' has no member 'x'` for a qualified access.
+- **Cycles are fine:** every file's exports are collected before any name is resolved.
+- **Following an import:** an imported name's `Symbol` has `origin`, the `(file, node index)` of its definition; `project.origin(symbol)` returns that file's `Symbol`, through re-exports. A module's local name has `module`, the key of the file it stands for.
+
+`check()` and `analyze()` see one file and cannot follow imports, so they assume the best: imported names are plain definitions, members of a module are not judged, and a wildcard import silences undefined names in that file. Use `analyze_project()` to have them checked.
+
 ### The symbol table
 
 `rules.analyze(source)` returns an `Analysis`:
@@ -156,7 +195,7 @@ analysis.at(offset)         # the Symbol defined or used at a byte offset, or No
 
 `resolve()` takes a zgram `Node`, a node index, or an AST object built by zgram (it reads `__znode__`), so an interpreter can look variables up by symbol and an editor can implement go-to-definition with `at()`.
 
-A `Symbol` has `name`, `namespace`, `builtin`, `node` and `span` (its definition; `None` for a builtin), `scope` (the index of its scope node; `None` for the global scope), `owns` (the index of the scope it names, if it has members), and `uses` / `use_spans`.
+A `Symbol` has `name`, `namespace`, `builtin`, `node` and `span` (its definition; `None` for a builtin), `scope` (the index of its scope node; `None` for the global scope), `owns` (the index of the scope it names, if it has members), `uses` / `use_spans`, and in a project `origin` and `module` (see above).
 
 ## Custom rules
 

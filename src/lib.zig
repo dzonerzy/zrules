@@ -170,6 +170,12 @@ fn scopes(args: pyoz.Args(struct {
     on_no_member: ?*PyObject = null,
     members: ?*PyObject = null,
     member_labels: ?*PyObject = null,
+    imports: ?*PyObject = null,
+    import_all: ?*PyObject = null,
+    import_labels: ?*PyObject = null,
+    exports: ?*PyObject = null,
+    on_no_module: ?*PyObject = null,
+    on_no_export: ?*PyObject = null,
     on_unresolved: ?*PyObject = null,
     messages: ?*PyObject = null,
     codes: ?*PyObject = null,
@@ -182,7 +188,9 @@ fn scopes(args: pyoz.Args(struct {
         .{ "on_redefine", a.on_redefine },   .{ "on_unused", a.on_unused },     .{ "on_shadow", a.on_shadow },
         .{ "messages", a.messages },         .{ "codes", a.codes },             .{ "after", a.after },
         .{ "on_unresolved", a.on_unresolved }, .{ "members", a.members },             .{ "member_labels", a.member_labels },
-        .{ "on_no_member", a.on_no_member },
+        .{ "on_no_member", a.on_no_member },   .{ "imports", a.imports },             .{ "import_all", a.import_all },
+        .{ "import_labels", a.import_labels }, .{ "exports", a.exports },             .{ "on_no_module", a.on_no_module },
+        .{ "on_no_export", a.on_no_export },
     }) };
 }
 
@@ -202,8 +210,11 @@ fn custom(args: pyoz.Args(struct {
 /// What to do about a kind of name problem
 const Level = enum { ignore, warning, err };
 
+const problem_kinds = @typeInfo(scopes_mod.ProblemKind).@"enum".fields.len;
+
 /// A compiled scopes() rule. Problem kinds index the arrays in the order of
-/// scopes_mod.ProblemKind: undefined, redefined, unused, shadowed, no_member.
+/// scopes_mod.ProblemKind: undefined, redefined, unused, shadowed, no_member,
+/// no_module, no_export.
 const ScopeRule = struct {
     namespace: []const u8,
     scope: []const Selector,
@@ -217,11 +228,21 @@ const ScopeRule = struct {
     members: []const Selector,
     member_target: u8,
     member_name: u8,
+    /// Import statements, and those that import every name of a module
+    imports: []const Selector,
+    import_all: []const Selector,
+    /// Field ids of an import's children: the module, the imported names
+    /// and the local alias (0 = the grammar has no such label)
+    import_module: u8,
+    import_names: u8,
+    import_alias: u8,
+    /// What a file offers to the others (empty = every top-level definition)
+    exports: []const Selector,
     builtins: []const []const u8,
     ordered: bool,
-    levels: [5]Level,
-    messages: [5][]const u8,
-    codes: [5][]const u8,
+    levels: [problem_kinds]Level,
+    messages: [problem_kinds][]const u8,
+    codes: [problem_kinds][]const u8,
     /// Called with (node, ctx) for a use that resolves to nothing; a true
     /// result means the language knows the name after all. A strong reference.
     on_unresolved: ?*PyObject = null,
@@ -302,15 +323,27 @@ const Symbol = struct {
     _scope: i64 = -1,
     /// Index of the scope node it names (whose definitions are its members); -1 = none
     _owns: i64 = -1,
+    /// (file key, node index) of the definition in another file, for an imported name
+    _origin: ?*PyObject = null,
+    /// File key, for the local name of an imported module
+    _module: ?*PyObject = null,
     /// list[int]: the nodes that use it, and list[(start, end)]: their spans
     _uses: ?*PyObject = null,
     _use_spans: ?*PyObject = null,
 
     pub fn __del__(self: *Symbol) void {
-        inline for (.{ "_name", "_namespace", "_uses", "_use_spans" }) |field| {
+        inline for (.{ "_name", "_namespace", "_uses", "_use_spans", "_origin", "_module" }) |field| {
             if (@field(self, field)) |obj| py.Py_DecRef(obj);
             @field(self, field) = null;
         }
+    }
+
+    pub fn get_origin(self: *const Symbol) pyoz.Signature(?*PyObject, "tuple[object, int] | None") {
+        return .{ .value = ownedOrNone(self._origin) };
+    }
+
+    pub fn get_module(self: *const Symbol) pyoz.Signature(?*PyObject, "object | None") {
+        return .{ .value = ownedOrNone(self._module) };
     }
 
     pub fn get_name(self: *const Symbol) pyoz.Signature(?*PyObject, "str") {
@@ -321,8 +354,9 @@ const Symbol = struct {
         return .{ .value = ownedOrNone(self._namespace) };
     }
 
+    /// Defined by the rules, not by the file (imported names are not builtins)
     pub fn get_builtin(self: *const Symbol) bool {
-        return self._node < 0;
+        return self._node < 0 and self._origin == null;
     }
 
     pub fn get_node(self: *const Symbol) ?i64 {
@@ -360,7 +394,7 @@ const Symbol = struct {
         return std.fmt.bufPrint(buf, "Symbol('{s}', defined at {d}..{d}, {d} uses)", .{ name, self._start, self._end, uses }) catch buf[0..0];
     }
 
-    pub const __doc__: [*:0]const u8 = "A name found by a scopes() rule: name, namespace, node and span of its definition (None for a builtin), scope (the node index of its scope, None for the global scope), owns (the node index of the scope it names, whose definitions are its members, or None), uses and use_spans.";
+    pub const __doc__: [*:0]const u8 = "A name found by a scopes() rule: name, namespace, node and span of its definition (None for a builtin), scope (the node index of its scope, None for the global scope), owns (the node index of the scope it names, whose definitions are its members, or None), uses and use_spans. In a project: origin ((file, node index) of the real definition of an imported name) and module (the file an imported module's name stands for).";
 };
 
 /// The node index an object stands for: an int, a zgram Node (its `index`)
@@ -399,8 +433,11 @@ const AnalysisData = struct {
     objects: []const []?*PyObject = &.{},
     /// The tree's nodes (owned by the Tree object the Analysis references)
     nodes: []const tree_mod.FlatNode = &.{},
+    /// In a project: every file's key, by file index (strong references)
+    keys: []const *PyObject = &.{},
 
     fn destroy(self: *AnalysisData) void {
+        for (self.keys) |k| py.Py_DecRef(k);
         for (self.objects) |per_result| {
             for (per_result) |o| {
                 if (o) |obj| py.Py_DecRef(obj);
@@ -417,7 +454,7 @@ const AnalysisData = struct {
             return obj;
         }
         const result = self.results[r];
-        const sym = result.result.symbols[index];
+        const sym = result.result.symbols.items[index];
         const uses = py.c.PyList_New(@intCast(sym.uses.len)) orelse return null;
         const spans = py.c.PyList_New(@intCast(sym.uses.len)) orelse {
             py.Py_DecRef(uses);
@@ -440,6 +477,13 @@ const AnalysisData = struct {
             value._node = sym.node;
             value._start = self.nodes[sym.node].text_start;
             value._end = self.nodes[sym.node].text_end;
+        }
+        if (sym.origin_file != NONE and sym.origin_file < self.keys.len) {
+            value._origin = py.c.Py_BuildValue("(OI)", self.keys[sym.origin_file], sym.origin_node);
+        }
+        if (sym.module != NONE and sym.module < self.keys.len) {
+            value._module = self.keys[sym.module];
+            py.Py_IncRef(value._module.?);
         }
         const obj = Module.toPy(Symbol, value) orelse {
             value.__del__();
@@ -467,7 +511,7 @@ const AnalysisData = struct {
     fn all(self: *AnalysisData) ?*PyObject {
         const list = py.c.PyList_New(0) orelse return null;
         for (self.results, 0..) |result, r| {
-            for (0..result.result.symbols.len) |index| {
+            for (0..result.result.symbols.items.len) |index| {
                 const obj = self.symbol(r, index) orelse {
                     py.Py_DecRef(list);
                     return null;
@@ -556,7 +600,7 @@ const Analysis = struct {
     pub fn at(self: *const Analysis, offset: i64) pyoz.Signature(?*PyObject, "Symbol | None") {
         const data = self._data orelse return .{ .value = none() };
         for (data.results, 0..) |result, r| {
-            for (result.result.symbols, 0..) |sym, index| {
+            for (result.result.symbols.items, 0..) |sym, index| {
                 var hit = false;
                 if (sym.node != NONE) {
                     const flat = data.nodes[sym.node];
@@ -674,6 +718,106 @@ fn oomObject() ?*PyObject {
     _ = py.c.PyErr_NoMemory();
     return null;
 }
+
+// ============================================================================
+// Project: the result of checking several files together
+// ============================================================================
+
+const Project = struct {
+    /// dict: file key -> Analysis, in the order the files were given
+    _analyses: ?*PyObject = null,
+
+    pub fn __del__(self: *Project) void {
+        if (self._analyses) |obj| py.Py_DecRef(obj);
+        self._analyses = null;
+    }
+
+    pub fn __len__(self: *const Project) i64 {
+        return if (self._analyses) |a| @intCast(py.c.PyDict_Size(a)) else 0;
+    }
+
+    /// The Analysis of one file.
+    pub fn file(self: *const Project, key: *PyObject) pyoz.Signature(?*PyObject, "Analysis") {
+        const found = py.c.PyDict_GetItemWithError(self._analyses orelse return .{ .value = null }, key);
+        if (found == null) {
+            if (py.c.PyErr_Occurred() == null) py.c.PyErr_SetObject(py.PyExc_KeyError(), key);
+            return .{ .value = null };
+        }
+        return .{ .value = ownedOrNone(found) };
+    }
+
+    pub fn get_files(self: *const Project) pyoz.Signature(?*PyObject, "list") {
+        return .{ .value = py.c.PyDict_Keys(self._analyses orelse return .{ .value = py.c.PyList_New(0) }) };
+    }
+
+    /// dict: file key -> list[Diagnostic]
+    pub fn get_diagnostics(self: *const Project) pyoz.Signature(?*PyObject, "dict[object, list[Diagnostic]]") {
+        const out = py.c.PyDict_New() orelse return .{ .value = null };
+        const analyses = self._analyses orelse return .{ .value = out };
+        var pos: py.Py_ssize_t = 0;
+        var key: ?*PyObject = null;
+        var value: ?*PyObject = null;
+        while (py.c.PyDict_Next(analyses, &pos, &key, &value) != 0) {
+            const list = py.c.PyObject_GetAttrString(value, "diagnostics") orelse {
+                py.Py_DecRef(out);
+                return .{ .value = null };
+            };
+            defer py.Py_DecRef(list);
+            if (py.PyDict_SetItem(out, key.?, list) != 0) {
+                py.Py_DecRef(out);
+                return .{ .value = null };
+            }
+        }
+        return .{ .value = out };
+    }
+
+    /// True when no file has an error.
+    pub fn get_ok(self: *const Project) bool {
+        const analyses = self._analyses orelse return true;
+        var pos: py.Py_ssize_t = 0;
+        var key: ?*PyObject = null;
+        var value: ?*PyObject = null;
+        while (py.c.PyDict_Next(analyses, &pos, &key, &value) != 0) {
+            const analysis = Module.fromPy(*const Analysis, value.?) catch {
+                py.c.PyErr_Clear();
+                continue;
+            };
+            if (!analysis.get_ok()) return false;
+        }
+        return true;
+    }
+
+    /// The Symbol an imported name really refers to, in the file that
+    /// defines it; the symbol itself if it isn't imported.
+    pub fn origin(self: *const Project, symbol: *PyObject) pyoz.Signature(?*PyObject, "Symbol") {
+        const sym = Module.fromPy(*const Symbol, symbol) catch {
+            py.c.PyErr_Clear();
+            raise(py.PyExc_TypeError(), "origin() takes a Symbol", .{});
+            return .{ .value = null };
+        };
+        const where = sym._origin orelse {
+            py.Py_IncRef(symbol);
+            return .{ .value = symbol };
+        };
+        const analysis = py.c.PyDict_GetItemWithError(self._analyses orelse return .{ .value = null }, py.PyTuple_GetItem(where, 0).?) orelse {
+            if (py.c.PyErr_Occurred() == null) raise(py.PyExc_KeyError(), "the symbol comes from a file that is not in this project", .{});
+            return .{ .value = null };
+        };
+        const found = py.c.PyObject_CallMethod(analysis, "resolve", "O", py.PyTuple_GetItem(where, 1).?) orelse return .{ .value = null };
+        // Follow re-exports to the end
+        if (found != py.Py_None() and found != symbol) {
+            defer py.Py_DecRef(found);
+            return self.origin(found);
+        }
+        return .{ .value = found };
+    }
+
+    pub const __doc__: [*:0]const u8 = "The result of Rules.analyze_project(): file(key) gives a file's Analysis; files, diagnostics (per file), ok, and origin(symbol) to follow an imported name to its definition.";
+    pub const file__doc__: [*:0]const u8 = "The Analysis of one file. Raises KeyError for a key that is not in the project.";
+    pub const file__params__ = "key";
+    pub const origin__doc__: [*:0]const u8 = "The Symbol an imported name really refers to, in the file that defines it (following re-exports); the symbol itself if it isn't imported.";
+    pub const origin__params__ = "symbol";
+};
 
 // ============================================================================
 // Rules
@@ -798,10 +942,10 @@ const Rules = struct {
         return @intCast(v);
     }
 
-    const problem_keys = [5][:0]const u8{ "undefined", "redefined", "unused", "shadowed", "no_member" };
+    const problem_keys = [problem_kinds][:0]const u8{ "undefined", "redefined", "unused", "shadowed", "no_member", "no_module", "no_export" };
 
     /// messages= / codes=: a dict overriding some of `defaults`, by problem kind.
-    fn problemTexts(state: *State, args: *PyObject, key: [*:0]const u8, defaults: [5][]const u8) ?[5][]const u8 {
+    fn problemTexts(state: *State, args: *PyObject, key: [*:0]const u8, defaults: [problem_kinds][]const u8) ?[problem_kinds][]const u8 {
         var out = defaults;
         const dict = py.c.PyDict_GetItemString(args, key) orelse return out;
         if (!py.PyDict_Check(dict)) {
@@ -819,7 +963,7 @@ const Rules = struct {
                 };
             }
             if (known != py.c.PyDict_Size(dict)) {
-                raise(py.PyExc_ValueError(), "{s}: the keys are 'undefined', 'redefined', 'unused', 'shadowed' and 'no_member'", .{std.mem.span(key)});
+                raise(py.PyExc_ValueError(), "{s}: the keys are 'undefined', 'redefined', 'unused', 'shadowed', 'no_member', 'no_module' and 'no_export'", .{std.mem.span(key)});
                 return null;
             }
         }
@@ -867,8 +1011,36 @@ const Rules = struct {
                 }
             }
         }
+        // Labels of an import's children: ("module", "names", "alias") by default
+        var import_labels = [3][]const u8{ "module", "names", "alias" };
+        if (py.c.PyDict_GetItemString(args, "import_labels")) |labels| {
+            const given = strings(arena, labels, "import_labels", false) orelse return null;
+            if (given.len != 3) {
+                raise(py.PyExc_ValueError(), "import_labels must be three labels: (module, names, alias)", .{});
+                return null;
+            }
+            import_labels = .{ given[0], given[1], given[2] };
+        }
+        const import_selectors = compileSelectors(state, py.c.PyDict_GetItemString(args, "imports"), "imports") orelse return null;
+        const import_all_selectors = compileSelectors(state, py.c.PyDict_GetItemString(args, "import_all"), "import_all") orelse return null;
+        var import_ids = [3]u8{ 0, 0, 0 };
+        for (import_labels, 0..) |label, i| {
+            for (state.names.fields, 1..) |f, id| {
+                if (std.mem.eql(u8, f, label)) import_ids[i] = @intCast(id);
+            }
+        }
+        if ((import_selectors.len != 0 or import_all_selectors.len != 0) and import_ids[0] == 0) {
+            raise(py.PyExc_ValueError(), "imports: the grammar has no label '{s}' (set import_labels=(module, names, alias))", .{import_labels[0]});
+            return null;
+        }
         sr.* = .{
             .namespace = textArg(state, args, "namespace", "name") orelse return null,
+            .imports = import_selectors,
+            .import_all = import_all_selectors,
+            .import_module = import_ids[0],
+            .import_names = import_ids[1],
+            .import_alias = import_ids[2],
+            .exports = compileSelectors(state, py.c.PyDict_GetItemString(args, "exports"), "exports") orelse return null,
             .members = member_selectors,
             .member_target = member_ids[0],
             .member_name = member_ids[1],
@@ -886,6 +1058,8 @@ const Rules = struct {
                 levelArg(args, "on_unused", .ignore) orelse return null,
                 levelArg(args, "on_shadow", .ignore) orelse return null,
                 levelArg(args, "on_no_member", .err) orelse return null,
+                levelArg(args, "on_no_module", .err) orelse return null,
+                levelArg(args, "on_no_export", .err) orelse return null,
             },
             .messages = problemTexts(state, args, "messages", .{
                 "undefined name '{text}'",
@@ -893,8 +1067,10 @@ const Rules = struct {
                 "'{text}' is never used",
                 "'{text}' shadows an outer definition",
                 "'{owner}' has no member '{text}'",
+                "module '{text}' not found",
+                "module '{owner}' has no '{text}'",
             }) orelse return null,
-            .codes = problemTexts(state, args, "codes", .{ "undefined-name", "redefined-name", "unused-name", "shadowed-name", "no-member" }) orelse return null,
+            .codes = problemTexts(state, args, "codes", .{ "undefined-name", "redefined-name", "unused-name", "shadowed-name", "no-member", "no-module", "no-export" }) orelse return null,
         };
         if (py.c.PyDict_GetItemString(args, "on_unresolved")) |f| {
             if (py.c.PyCallable_Check(f) == 0) {
@@ -1164,6 +1340,41 @@ const Rules = struct {
         result: scopes_mod.Result,
     };
 
+    /// The files of a project, for resolving imports between them
+    const Link = struct {
+        runs: []const *Run,
+        keys: []const *PyObject,
+        /// Each key's text when it is a str, else ""
+        key_texts: []const []const u8,
+        /// resolve(module_text, importing_key) -> key or None. Without one,
+        /// a module's text (minus quotes) is the key of its file.
+        resolver: ?*PyObject,
+
+        /// The index of the file that `module`, written in file `from`,
+        /// refers to; null if there is none.
+        fn resolve(self: *const Link, from: usize, module: []const u8) error{PythonError}!?u32 {
+            if (self.resolver) |function| {
+                const text = py.PyUnicode_FromStringAndSize(module.ptr, @intCast(module.len)) orelse return error.PythonError;
+                defer py.Py_DecRef(text);
+                const key = py.c.PyObject_CallFunctionObjArgs(function, text, self.keys[from], @as(?*PyObject, null)) orelse return error.PythonError;
+                defer py.Py_DecRef(key);
+                if (key == py.Py_None()) return null;
+                for (self.keys, 0..) |k, i| {
+                    const same = py.c.PyObject_RichCompareBool(k, key, py.c.Py_EQ);
+                    if (same < 0) return error.PythonError;
+                    if (same == 1) return @intCast(i);
+                }
+                return null;
+            }
+            var name = module;
+            if (name.len >= 2 and (name[0] == '"' or name[0] == '\'') and name[name.len - 1] == name[0]) name = name[1 .. name.len - 1];
+            for (self.key_texts, 0..) |k, i| {
+                if (k.len != 0 and std.mem.eql(u8, k, name)) return @intCast(i);
+            }
+            return null;
+        }
+    };
+
     const Run = struct {
         arena: std.mem.Allocator,
         state: *const State,
@@ -1173,6 +1384,9 @@ const Rules = struct {
         /// Undefined names whose scopes() rule has an on_unresolved function
         /// to ask first (from Python, once the symbols are available)
         unresolved: std.ArrayList(Unresolved) = .empty,
+        scope_inputs: std.ArrayList(ScopeInput) = .empty,
+        /// Several files are being checked together: exports are needed
+        in_project: bool = false,
 
         /// Nodes grouped by grammar rule: rule r's nodes, in source order,
         /// are by_rule[rule_start[r]..rule_start[r + 1]]. A rule only looks
@@ -1186,6 +1400,38 @@ const Rules = struct {
         every_node: ?[]const u32 = null,
 
         const Unresolved = struct { rule: *const ScopeRule, problem: scopes_mod.Problem };
+
+        /// One imported name: what the other file calls it, and the node
+        /// that names it here
+        const ImportName = struct {
+            imported: []const u8,
+            /// The node holding the imported name (where a missing one is reported)
+            node: u32,
+            local: u32,
+        };
+
+        const Import = struct {
+            /// The node naming the module
+            module: u32,
+            names: []const ImportName,
+            /// The node defining the module's local name; NONE when the
+            /// import brings in names instead
+            local: u32,
+            wildcard: bool,
+        };
+
+        /// What a scopes() rule matched in this file, kept between the two
+        /// passes of a check (every file's exports, then the resolution)
+        const ScopeInput = struct {
+            rule: *const ScopeRule,
+            scope_nodes: []const u32,
+            defs: []const scopes_mod.Definition,
+            uses: []const u32,
+            members: []const scopes_mod.Member,
+            imports: []const Import,
+            /// Top-level names this file offers to the others -> defining node
+            exports: std.StringHashMapUnmanaged(u32) = .empty,
+        };
 
         fn buildIndex(self: *Run) !void {
             const nodes = self.tree.nodes;
@@ -1343,7 +1589,21 @@ const Rules = struct {
             return out.items[0..kept];
         }
 
-        fn checkScopes(self: *Run, sr: *const ScopeRule) !void {
+        /// The child of `node` labelled `field`, or NONE (field 0 never matches).
+        fn childLabelled(self: *const Run, node: u32, field: u8) u32 {
+            if (field == 0) return NONE;
+            const t = self.tree;
+            const stop = t.end(node);
+            var child = node + 1;
+            while (child < stop) : (child = t.end(child)) {
+                if (t.nodes[child].fieldId() == field) return child;
+            }
+            return NONE;
+        }
+
+        /// First pass of a scopes() rule: match its selectors, find the
+        /// imports, and (in a project) work out what the file exports.
+        fn prepareScopes(self: *Run, sr: *const ScopeRule) !void {
             const t = self.tree;
             const scope_nodes = try self.matchAll(sr.scope);
             const inner = try self.matchAll(sr.define);
@@ -1364,38 +1624,222 @@ const Rules = struct {
                 const whole = parent != NONE and std.sort.binarySearch(u32, after, d.node, orderU32) != null;
                 d.visible_from = t.nodes[if (whole) parent else d.node].text_end;
             }
+
+            // Imports define names too: the imported names (or their
+            // aliases), or the module's name (or its alias)
+            var imports: std.ArrayList(Import) = .empty;
+            const wild = try self.matchAll(sr.import_all);
+            const both = try self.arena.alloc(Selector, sr.imports.len + sr.import_all.len);
+            @memcpy(both[0..sr.imports.len], sr.imports);
+            @memcpy(both[sr.imports.len..], sr.import_all);
+            const import_nodes = try self.matchAll(both);
+            for (import_nodes) |node| {
+                const module = self.childLabelled(node, sr.import_module);
+                if (module == NONE) continue;
+                var import = Import{
+                    .module = module,
+                    .names = &.{},
+                    .local = NONE,
+                    .wildcard = std.sort.binarySearch(u32, wild, node, orderU32) != null,
+                };
+                var names: std.ArrayList(ImportName) = .empty;
+                if (!import.wildcard and sr.import_names != 0) {
+                    const stop = t.end(node);
+                    var child = node + 1;
+                    while (child < stop) : (child = t.end(child)) {
+                        if (t.nodes[child].fieldId() != sr.import_names) continue;
+                        // `name as alias`: a node holding both, the alias labelled
+                        const alias = self.childLabelled(child, sr.import_alias);
+                        // The imported name is the node's first child when
+                        // that is a node of its own, else the node's text
+                        const first = child + 1;
+                        const name_node = if (alias != NONE and first != alias and first < t.end(child)) first else child;
+                        var imported = t.text(name_node);
+                        if (alias != NONE and name_node == child) imported = imported[0 .. t.nodes[alias].text_start - t.nodes[child].text_start];
+                        try names.append(self.arena, .{
+                            .imported = std.mem.trim(u8, imported, " \t\r\n"),
+                            .node = name_node,
+                            .local = if (alias != NONE) alias else child,
+                        });
+                    }
+                }
+                import.names = names.items;
+                const end_of_import = t.nodes[node].text_end;
+                if (names.items.len != 0) {
+                    for (names.items) |n| try defs.append(self.arena, .{ .node = n.local, .visible_from = end_of_import });
+                } else if (!import.wildcard) {
+                    const alias = self.childLabelled(node, sr.import_alias);
+                    import.local = if (alias != NONE) alias else module;
+                    try defs.append(self.arena, .{ .node = import.local, .visible_from = end_of_import });
+                }
+                try imports.append(self.arena, import);
+            }
+
             std.sort.pdq(scopes_mod.Definition, defs.items, {}, struct {
                 fn lt(_: void, a: scopes_mod.Definition, b: scopes_mod.Definition) bool {
                     return a.node < b.node;
                 }
             }.lt);
+            // A node listed twice (in `define` and as an import's name) defines once
+            var kept: usize = 0;
+            for (defs.items) |d| {
+                if (kept != 0 and defs.items[kept - 1].node == d.node) continue;
+                defs.items[kept] = d;
+                kept += 1;
+            }
+            defs.items.len = kept;
 
             var members: std.ArrayList(scopes_mod.Member) = .empty;
             for (try self.matchAll(sr.members)) |node| {
-                var target: u32 = NONE;
-                var name: u32 = NONE;
-                const stop = t.end(node);
-                var child = node + 1;
-                while (child < stop) : (child = t.end(child)) {
-                    const field = t.nodes[child].fieldId();
-                    if (field == sr.member_target and target == NONE) target = child;
-                    if (field == sr.member_name and name == NONE) name = child;
-                }
+                const target = self.childLabelled(node, sr.member_target);
+                const name = self.childLabelled(node, sr.member_name);
                 if (target != NONE and name != NONE) try members.append(self.arena, .{ .node = node, .target = target, .name = name });
+            }
+
+            // Nothing inside an import statement is a use: the module's name
+            // and the imported names refer to another file
+            var kept_uses = uses;
+            if (import_nodes.len != 0) {
+                const filtered = try self.arena.alloc(u32, uses.len);
+                var n: usize = 0;
+                var next_import: usize = 0;
+                for (uses) |use| {
+                    while (next_import < import_nodes.len and t.end(import_nodes[next_import]) <= use) next_import += 1;
+                    if (next_import < import_nodes.len and use >= import_nodes[next_import]) continue;
+                    filtered[n] = use;
+                    n += 1;
+                }
+                kept_uses = filtered[0..n];
+            }
+
+            var input = ScopeInput{
+                .rule = sr,
+                .scope_nodes = scope_nodes,
+                .defs = defs.items,
+                .uses = kept_uses,
+                .members = members.items,
+                .imports = imports.items,
+            };
+            if (self.in_project and (sr.imports.len != 0 or sr.import_all.len != 0)) {
+                // What the other files can import: the top-level definitions
+                const top = try scopes_mod.analyze(self.arena, t, scope_nodes, defs.items, &.{}, &.{}, &.{}, &.{}, .{});
+                for (top.symbols.items) |sym| {
+                    if (!sym.exported or sym.node == NONE) continue;
+                    if (sr.exports.len != 0 and !self.anyMatches(sr.exports, sym.node)) continue;
+                    const entry = try input.exports.getOrPut(self.arena, sym.name);
+                    if (!entry.found_existing) entry.value_ptr.* = sym.node;
+                }
+            }
+            try self.scope_inputs.append(self.arena, input);
+        }
+
+        const FinishError = error{ OutOfMemory, PythonError };
+
+        /// Second pass of a scopes() rule: resolve the imports against the
+        /// other files' exports (`link`; null when checking one file alone),
+        /// then resolve every name.
+        fn finishScopes(self: *Run, index: usize, link: ?*const Link, file: usize) FinishError!void {
+            const t = self.tree;
+            const input = &self.scope_inputs.items[index];
+            const sr = input.rule;
+
+            const Origin = struct { file: u32, node: u32 };
+            var externals: std.ArrayList(scopes_mod.External) = .empty;
+            var origins: std.AutoHashMapUnmanaged(u32, Origin) = .empty;
+            var modules: std.AutoHashMapUnmanaged(u32, u32) = .empty;
+            var import_problems: std.ArrayList(scopes_mod.Problem) = .empty;
+            var assume_defined = false;
+
+            for (input.imports) |import| {
+                const module_text = t.text(import.module);
+                // One file alone: what a module offers is unknown, so is
+                // what a wildcard import brings in
+                const target: ?u32 = if (link) |l| try l.resolve(file, module_text) else null;
+                const other = target orelse {
+                    if (link != null) try import_problems.append(self.arena, .{ .kind = .no_module, .node = import.module });
+                    if (import.wildcard) assume_defined = true;
+                    continue;
+                };
+                const offered = &link.?.runs[other].scope_inputs.items[index].exports;
+                if (import.wildcard) {
+                    var it = offered.iterator();
+                    while (it.next()) |entry| try externals.append(self.arena, .{ .name = entry.key_ptr.*, .file = other, .node = entry.value_ptr.* });
+                } else if (import.names.len != 0) {
+                    for (import.names) |name| {
+                        if (offered.get(name.imported)) |node| {
+                            try origins.put(self.arena, name.local, .{ .file = other, .node = node });
+                        } else {
+                            try import_problems.append(self.arena, .{ .kind = .no_export, .node = name.node, .owner = module_text });
+                        }
+                    }
+                } else try modules.put(self.arena, import.local, other);
             }
 
             // The Analysis may outlive the Rules: names it keeps must live in its arena
             const builtins = try self.arena.alloc([]const u8, sr.builtins.len);
             for (builtins, sr.builtins) |*slot, name| slot.* = try self.arena.dupe(u8, name);
 
-            const result = try scopes_mod.analyze(self.arena, t, scope_nodes, defs.items, uses, members.items, builtins, .{
+            var result = try scopes_mod.analyze(self.arena, t, input.scope_nodes, input.defs, input.uses, input.members, builtins, externals.items, .{
                 .ordered = sr.ordered,
                 .report_unused = sr.levels[@intFromEnum(scopes_mod.ProblemKind.unused)] != .ignore,
                 .report_shadowed = sr.levels[@intFromEnum(scopes_mod.ProblemKind.shadowed)] != .ignore,
+                .assume_defined = assume_defined,
             });
+
+            for (result.symbols.items) |*sym| {
+                if (sym.node == NONE) continue;
+                if (origins.get(sym.node)) |o| {
+                    sym.origin_file = o.file;
+                    sym.origin_node = o.node;
+                }
+                if (modules.get(sym.node)) |m| sym.module = m;
+            }
+
+            // `module.name`: look the name up in what the module exports
+            var external_index: std.AutoHashMapUnmanaged(u64, u32) = .empty;
+            var external_uses: std.ArrayList(struct { symbol: u32, node: u32 }) = .empty;
+            for (result.open_members) |m| {
+                const owner = result.symbols.items[result.by_node[m.target]];
+                if (owner.module == NONE) continue;
+                const offered = &link.?.runs[owner.module].scope_inputs.items[index].exports;
+                const name = t.text(m.name);
+                const node = offered.get(name) orelse {
+                    try import_problems.append(self.arena, .{ .kind = .no_member, .node = m.name, .other = owner.node });
+                    continue;
+                };
+                const entry = try external_index.getOrPut(self.arena, (@as(u64, owner.module) << 32) | node);
+                if (!entry.found_existing) {
+                    entry.value_ptr.* = @intCast(result.symbols.items.len);
+                    try result.symbols.append(self.arena, .{ .name = name, .node = NONE, .scope = NONE, .hoisted = true, .origin_file = owner.module, .origin_node = node });
+                }
+                result.by_node[m.name] = entry.value_ptr.*;
+                result.by_node[m.node] = entry.value_ptr.*;
+                try external_uses.append(self.arena, .{ .symbol = entry.value_ptr.*, .node = m.name });
+            }
+            if (external_uses.items.len != 0) {
+                // Group them per symbol, in source order
+                const Use = @TypeOf(external_uses.items[0]);
+                std.sort.pdq(Use, external_uses.items, {}, struct {
+                    fn lt(_: void, a: Use, b: Use) bool {
+                        return if (a.symbol != b.symbol) a.symbol < b.symbol else a.node < b.node;
+                    }
+                }.lt);
+                const nodes = try self.arena.alloc(u32, external_uses.items.len);
+                var start: usize = 0;
+                for (external_uses.items, 0..) |u, i| {
+                    nodes[i] = u.node;
+                    const last = i + 1 == external_uses.items.len or external_uses.items[i + 1].symbol != u.symbol;
+                    if (last) {
+                        result.symbols.items[u.symbol].uses = nodes[start .. i + 1];
+                        start = i + 1;
+                    }
+                }
+            }
+
             try self.scope_results.append(self.arena, .{ .namespace = try self.arena.dupe(u8, sr.namespace), .result = result });
 
-            for (result.problems) |p| {
+            for (import_problems.items) |p| try self.reportProblem(sr, p);
+            for (result.problems.items) |p| {
                 if (p.kind == .undefined and sr.on_unresolved != null) {
                     try self.unresolved.append(self.arena, .{ .rule = sr, .problem = p });
                 } else try self.reportProblem(sr, p);
@@ -1408,7 +1852,7 @@ const Rules = struct {
             if (sr.levels[k] == .ignore) return;
             const flat = t.nodes[p.node];
             var v = self.values(p.node);
-            if (p.kind == .no_member and p.other != NONE) v.owner = t.text(p.other);
+            v.owner = if (p.owner.len != 0) p.owner else if (p.other != NONE) t.text(p.other) else "";
             var finding = Finding{
                 .start = flat.text_start,
                 .end = flat.text_end,
@@ -1436,7 +1880,7 @@ const Rules = struct {
         fn check(self: *Run, rule_idx: usize) !void {
             const cr = &self.state.rules.items[rule_idx];
             if (cr.kind == .custom) return; // run afterwards, from Python
-            if (cr.scope) |sr| return self.checkScopes(sr);
+            if (cr.scope) |sr| return self.prepareScopes(sr);
             const t = self.tree;
             var chain_buf: [selector.MAX_COMPOUNDS]u32 = undefined;
 
@@ -1653,23 +2097,139 @@ const Rules = struct {
 
     /// Check a tree and return everything found: diagnostics and symbols.
     pub fn analyze(self: *Rules, source: *PyObject) pyoz.Signature(?*PyObject, "Analysis") {
-        return .{ .value = self.analyzeImpl(source) };
+        var out: [1]*PyObject = undefined;
+        if (!self.analyzeFiles(&.{source}, null, null, &out)) return .{ .value = null };
+        return .{ .value = out[0] };
     }
 
     /// Check a tree (a zgram Tree or Node, or source text to parse first)
     /// against the rules. Returns the diagnostics in source order.
     pub fn check(self: *Rules, source: *PyObject) pyoz.Signature(?*PyObject, "list[Diagnostic]") {
-        const analysis = self.analyzeImpl(source) orelse return .{ .value = null };
-        defer py.Py_DecRef(analysis);
-        return .{ .value = py.c.PyObject_GetAttrString(analysis, "diagnostics") };
+        var out: [1]*PyObject = undefined;
+        if (!self.analyzeFiles(&.{source}, null, null, &out)) return .{ .value = null };
+        defer py.Py_DecRef(out[0]);
+        return .{ .value = py.c.PyObject_GetAttrString(out[0], "diagnostics") };
     }
 
-    fn analyzeImpl(self: *Rules, source: *PyObject) ?*PyObject {
+    /// Check several files together: imports between them are resolved.
+    /// `files` maps a key (usually a module name or a path) to a source.
+    pub fn analyze_project(self: *Rules, args: pyoz.Args(struct { files: *PyObject, resolve: ?*PyObject = null })) pyoz.Signature(?*PyObject, "Project") {
+        const files = args.value.files;
+        if (!py.PyDict_Check(files)) {
+            raise(py.PyExc_TypeError(), "files must be a dict of key -> source (a zgram Tree or Node, or text)", .{});
+            return .{ .value = null };
+        }
+        var resolver = args.value.resolve;
+        if (resolver) |r| {
+            if (r == py.Py_None()) resolver = null else if (py.c.PyCallable_Check(r) == 0) {
+                raise(py.PyExc_TypeError(), "resolve must be callable: resolve(module, importing_file) -> file or None", .{});
+                return .{ .value = null };
+            }
+        }
+        const n: usize = @intCast(py.c.PyDict_Size(files));
+        const keys = allocator.alloc(*PyObject, n) catch return .{ .value = oomObject() };
+        defer allocator.free(keys);
+        const sources = allocator.alloc(*PyObject, n) catch return .{ .value = oomObject() };
+        defer allocator.free(sources);
+        const out = allocator.alloc(*PyObject, n) catch return .{ .value = oomObject() };
+        defer allocator.free(out);
+        var pos: py.Py_ssize_t = 0;
+        var key: ?*PyObject = null;
+        var value: ?*PyObject = null;
+        var i: usize = 0;
+        while (py.c.PyDict_Next(files, &pos, &key, &value) != 0 and i < n) : (i += 1) {
+            keys[i] = key.?;
+            sources[i] = value.?;
+        }
+        if (!self.analyzeFiles(sources[0..i], keys[0..i], resolver, out)) return .{ .value = null };
+        defer for (out[0..i]) |obj| py.Py_DecRef(obj);
+
+        const analyses = py.c.PyDict_New() orelse return .{ .value = null };
+        for (keys[0..i], out[0..i]) |k, analysis| {
+            if (py.PyDict_SetItem(analyses, k, analysis) != 0) {
+                py.Py_DecRef(analyses);
+                return .{ .value = null };
+            }
+        }
+        return .{ .value = Module.toPy(Project, .{ ._analyses = analyses }) orelse blk: {
+            py.Py_DecRef(analyses);
+            break :blk null;
+        } };
+    }
+
+    /// One file of a check: its Analysis object (which owns the tree and
+    /// the arena everything else here lives in) and the state of its run
+    const File = struct {
+        analysis_obj: *PyObject,
+        analysis: *Analysis,
+        data: *AnalysisData,
+        run: *Run,
+        input: []const u8,
+    };
+
+    /// Check `sources` together. `keys` names them (null: one file checked
+    /// alone, whose imports can't be followed). On success `out` receives a
+    /// new reference to each file's Analysis.
+    fn analyzeFiles(self: *Rules, sources: []const *PyObject, keys: ?[]const *PyObject, resolver: ?*PyObject, out: []*PyObject) bool {
         const state = self._state orelse {
             raise(py.PyExc_RuntimeError(), "Rules is not initialized", .{});
-            return null;
+            return false;
         };
+        const files = allocator.alloc(File, sources.len) catch return oomObject() != null;
+        defer allocator.free(files);
+        var opened: usize = 0;
+        var done = false;
+        defer if (!done) {
+            for (files[0..opened]) |f| py.Py_DecRef(f.analysis_obj);
+        };
+        for (sources) |source| {
+            files[opened] = self.openFile(state, source) orelse return false;
+            files[opened].run.in_project = keys != null;
+            opened += 1;
+        }
 
+        // Pass 1: the structural rules, and what each file defines and exports
+        for (files) |f| {
+            f.run.buildIndex() catch return oomObject() != null;
+            for (0..state.rules.items.len) |i| f.run.check(i) catch return oomObject() != null;
+        }
+
+        // Pass 2: names, with the imports resolved against the other files
+        const runs = allocator.alloc(*Run, files.len) catch return oomObject() != null;
+        defer allocator.free(runs);
+        const key_texts = allocator.alloc([]const u8, files.len) catch return oomObject() != null;
+        defer allocator.free(key_texts);
+        for (files, 0..) |f, i| {
+            runs[i] = f.run;
+            key_texts[i] = "";
+            if (keys) |ks| {
+                if (py.PyUnicode_Check(ks[i])) {
+                    var len: py.Py_ssize_t = 0;
+                    if (py.c.PyUnicode_AsUTF8AndSize(ks[i], &len)) |ptr| key_texts[i] = ptr[0..@intCast(len)] else py.c.PyErr_Clear();
+                }
+            }
+        }
+        const link = Link{ .runs = runs, .keys = keys orelse &.{}, .key_texts = key_texts, .resolver = resolver };
+        for (files, 0..) |f, file_index| {
+            for (0..f.run.scope_inputs.items.len) |index| {
+                f.run.finishScopes(index, if (keys != null) &link else null, file_index) catch |e| switch (e) {
+                    error.OutOfMemory => return oomObject() != null,
+                    error.PythonError => return false,
+                };
+            }
+        }
+
+        // Pass 3: the parts that call into Python, and the diagnostics
+        for (files) |f| {
+            if (!finishFile(f, keys)) return false;
+        }
+        for (files, 0..) |f, i| out[i] = f.analysis_obj;
+        done = true;
+        return true;
+    }
+
+    /// Read a source's tree through its capsule and set up its run.
+    fn openFile(self: *Rules, state: *State, source: *PyObject) ?File {
         // Text is parsed first; a Node stands for its Tree
         var tree_obj: *PyObject = undefined;
         if (py.PyUnicode_Check(source) or py.PyBytes_Check(source)) {
@@ -1705,7 +2265,7 @@ const Rules = struct {
 
         // The check runs in an arena that the Analysis keeps: the names it
         // found stay there, and Symbol objects are made from them on demand
-        const data = allocator.create(AnalysisData) catch return oomObject();
+        const data = allocator.create(AnalysisData) catch return oomFile();
         data.* = .{ .arena = std.heap.ArenaAllocator.init(allocator) };
         py.Py_IncRef(tree_obj);
         const analysis_obj = Module.toPy(Analysis, .{ ._tree = tree_obj, ._data = data }) orelse {
@@ -1720,60 +2280,78 @@ const Rules = struct {
 
         const nodes: []const tree_mod.FlatNode = if (view.nodes) |n| n[0..view.node_count] else &.{};
         const input: []const u8 = if (view.input) |p| p[0..view.input_len] else "";
-        const tree = Tree{
+        const tree = arena.create(Tree) catch return oomFile();
+        tree.* = .{
             .nodes = nodes,
             .input = input,
-            .parents = Tree.computeParents(arena, nodes) catch return oomObject(),
+            .parents = Tree.computeParents(arena, nodes) catch return oomFile(),
         };
         data.nodes = nodes;
+        const run = arena.create(Run) catch return oomFile();
+        run.* = .{ .arena = arena, .state = state, .tree = tree };
 
-        var run = Run{ .arena = arena, .state = state, .tree = &tree };
-        run.buildIndex() catch return oomObject();
-        for (0..state.rules.items.len) |i| run.check(i) catch return oomObject();
+        done = true;
+        return .{ .analysis_obj = analysis_obj, .analysis = analysis, .data = data, .run = run, .input = input };
+    }
 
-        const objects = arena.alloc([]?*PyObject, run.scope_results.items.len) catch return oomObject();
+    fn oomFile() ?File {
+        _ = py.c.PyErr_NoMemory();
+        return null;
+    }
+
+    /// Last pass for one file: hand the names to its Analysis, run the rules
+    /// written in Python, and turn the findings into Diagnostic objects.
+    fn finishFile(f: File, keys: ?[]const *PyObject) bool {
+        const run = f.run;
+        const arena = run.arena;
+
+        const objects = arena.alloc([]?*PyObject, run.scope_results.items.len) catch return oomObject() != null;
         for (objects, run.scope_results.items) |*slot, result| {
-            slot.* = arena.alloc(?*PyObject, result.result.symbols.len) catch return oomObject();
+            slot.* = arena.alloc(?*PyObject, result.result.symbols.items.len) catch return oomObject() != null;
             @memset(slot.*, null);
         }
-        data.results = run.scope_results.items;
-        data.objects = objects;
+        f.data.results = run.scope_results.items;
+        f.data.objects = objects;
+        if (keys) |ks| {
+            const kept = arena.dupe(*PyObject, ks) catch return oomObject() != null;
+            for (kept) |k| py.Py_IncRef(k);
+            f.data.keys = kept;
+        }
 
-        if (!runPython(&run, tree_obj, analysis_obj)) return null;
+        if (!runPython(run, f.analysis._tree.?, f.analysis_obj)) return false;
 
         std.sort.pdq(Finding, run.findings.items, {}, Finding.before);
 
-        const zgram = py.c.PyImport_ImportModule("zgram") orelse return null;
+        const zgram = py.c.PyImport_ImportModule("zgram") orelse return false;
         defer py.Py_DecRef(zgram);
-        const cls = py.c.PyObject_GetAttrString(zgram, "Diagnostic") orelse return null;
+        const cls = py.c.PyObject_GetAttrString(zgram, "Diagnostic") orelse return false;
         defer py.Py_DecRef(cls);
 
-        const lines: []const u32 = if (run.findings.items.len == 0) &.{} else lineStarts(arena, input) catch return oomObject();
-        const list = py.c.PyList_New(@intCast(run.findings.items.len)) orelse return null;
-        for (run.findings.items, 0..) |f, i| {
+        const lines: []const u32 = if (run.findings.items.len == 0) &.{} else lineStarts(arena, f.input) catch return oomObject() != null;
+        const list = py.c.PyList_New(@intCast(run.findings.items.len)) orelse return false;
+        for (run.findings.items, 0..) |finding, i| {
             var notes: ?*PyObject = null;
             defer if (notes) |n| py.Py_DecRef(n);
-            if (f.has_note) {
-                const note_obj = diagnostic(cls, "note", "", f.note, f.note_start, f.note_end, lines, null) orelse {
+            if (finding.has_note) {
+                const note_obj = diagnostic(cls, "note", "", finding.note, finding.note_start, finding.note_end, lines, null) orelse {
                     py.Py_DecRef(list);
-                    return null;
+                    return false;
                 };
                 notes = py.c.PyList_New(1);
                 if (notes) |n| _ = py.c.PyList_SetItem(n, 0, note_obj) else {
                     py.Py_DecRef(note_obj);
                     py.Py_DecRef(list);
-                    return null;
+                    return false;
                 }
             }
-            const d = diagnostic(cls, f.severity, f.code, f.message, f.start, f.end, lines, notes) orelse {
+            const d = diagnostic(cls, finding.severity, finding.code, finding.message, finding.start, finding.end, lines, notes) orelse {
                 py.Py_DecRef(list);
-                return null;
+                return false;
             };
             _ = py.c.PyList_SetItem(list, @intCast(i), d);
         }
-        analysis._diagnostics = list;
-        done = true;
-        return analysis_obj;
+        f.analysis._diagnostics = list;
+        return true;
     }
 
     pub const __doc__: [*:0]const u8 = "Rules(parser, rules=None): rules compiled against a zgram parser's grammar. check(source) returns the zgram.Diagnostic of every violation, in source order; analyze(source) also returns the symbols found by scopes() rules.";
@@ -1781,6 +2359,7 @@ const Rules = struct {
     pub const check__params__ = "source";
     pub const analyze__doc__: [*:0]const u8 = "Like check(), but returns an Analysis: diagnostics, tree, symbols, and resolve(node) / at(offset) to look names up.";
     pub const analyze__params__ = "source";
+    pub const analyze_project__doc__: [*:0]const u8 = "Check several files together, resolving the imports between them. files is a dict of key -> source; resolve(module_text, importing_key) returns the key of the file a module name refers to, or None (default: the module's text, without quotes, is the key). Returns a Project.";
     pub const add__doc__: [*:0]const u8 = "Add a custom rule: function(node, ctx) is called for every node matching the selector. Returns the function.";
     pub const rule__doc__: [*:0]const u8 = "Decorator form of add(): @rules.rule('Call') above a function(node, ctx).";
 };
@@ -1805,7 +2384,7 @@ pub const Module = pyoz.module(.{
         pyoz.func("forbid", forbid, "forbid(selector, message=None, code=None, severity=None): no node may match `selector`."),
         pyoz.func("require", require, "require(selector, message=None, code=None, severity=None): every node matching all but the last part of `selector` must have a match of the whole selector."),
         pyoz.func("count", count, "count(selector, exactly=None, min=None, max=None, message=None, code=None, severity=None): the number of matches within the node the selector's first part matched must be in range."),
-        pyoz.func("scopes", scopes, "scopes(scope, define, use, define_outer=None, hoist=None, after=None, builtins=None, ordered=True, namespace='name', on_undefined='error', on_redefine='error', on_unused='ignore', on_shadow='ignore', on_no_member='error', members=None, member_labels=('target', 'name'), on_unresolved=None, messages=None, codes=None): resolve names. `scope` nodes open a scope; `define` nodes define their text as a name in the scope around them (`define_outer`: in the scope outside that one); `use` nodes must resolve to a definition. `hoist` definitions are visible before their position; `after` definitions only once their parent node has ended. `members` nodes are accesses like a.b: the child labelled name is looked up in the scope that the child labelled target names."),
+        pyoz.func("scopes", scopes, "scopes(scope, define, use, define_outer=None, hoist=None, after=None, builtins=None, ordered=True, namespace='name', on_undefined='error', on_redefine='error', on_unused='ignore', on_shadow='ignore', on_no_member='error', members=None, member_labels=('target', 'name'), imports=None, import_all=None, import_labels=('module', 'names', 'alias'), exports=None, on_no_module='error', on_no_export='error', on_unresolved=None, messages=None, codes=None): resolve names. `scope` nodes open a scope; `define` nodes define their text as a name in the scope around them (`define_outer`: in the scope outside that one); `use` nodes must resolve to a definition. `hoist` definitions are visible before their position; `after` definitions only once their parent node has ended. `members` nodes are accesses like a.b: the child labelled name is looked up in the scope that the child labelled target names."),
         pyoz.func("custom", custom, "custom(selector, function, code=None): call function(node, ctx) for every node matching `selector`."),
         pyoz.func("version", version, "Return the zrules version string"),
     },
@@ -1815,6 +2394,7 @@ pub const Module = pyoz.module(.{
         pyoz.class("Analysis", Analysis),
         pyoz.class("Symbol", Symbol),
         pyoz.class("Context", Context),
+        pyoz.class("Project", Project),
     },
 });
 

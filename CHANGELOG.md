@@ -5,6 +5,18 @@ All notable changes to zrules are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.4] - 2026-10-01
+
+### Added
+- **`Analysis.capsule`** (`"zrules.analysis.v1"`) and **`Selector.capsule`** (`"zrules.selector.v1"`): the symbol table and a selector's match function for native code in other packages, without a Python object per symbol, use or node (`src/native_abi.zig` is the layout). zlsp reads its results this way.
+
+### Fixed
+- **An imported name used as a type** was an `unknown type` when its definition couldn't be seen: in a file checked on its own (which assumes imported names are fine), or when the module is missing (already reported as `no-module`). A name whose type isn't known is no longer judged as a type; a name known not to be one still is.
+- **Basic type names** (`int`, `float`, ...) had no type as symbols; they are now `type[int]`, like a struct's name is `type[Point]`.
+
+### Performance
+- `Selector.match()` rejects a node by the rule and label its selector's last part names before matching the whole selector.
+
 ## [0.1.3] - 2026-10-01
 
 ### Added

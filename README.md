@@ -472,6 +472,7 @@ The [reference](https://github.com/dzonerzy/zrules/blob/main/docs/reference.md) 
 | `rules.analyze_project(files, resolve=None, recover=False)` | several files together, in parallel |
 | `analysis.visible(offset)` | the names visible at a position (for completion) |
 | `Selector(parser, text).match(tree)` | a selector on its own: the matching nodes |
+| `analysis.capsule`, `selector.capsule` | the symbol table and a selector's match function, for native code |
 
 ## Architecture
 
@@ -531,6 +532,7 @@ src/
   scopes.zig            # Names: scopes, definitions, uses, members
   types.zig             # Types: the interned table, inference, the checks
   flow.zig              # Control flow: reachability, returns, variables without a value
+  native_abi.zig        # The analysis and selector capsules, for native code in other packages
 test/
   conftest.py           # A small language with imports, enums and members
   typed.py              # The typed language of examples/typed, for the types and flow tests

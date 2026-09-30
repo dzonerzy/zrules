@@ -1,5 +1,7 @@
-"""What editor tooling (zlsp) needs: Selector on its own, Analysis.visible()."""
+"""What editor tooling (zlsp) needs: Selector on its own, Analysis.visible(),
+and both through capsules for native code."""
 
+import ctypes
 import os
 import sys
 
@@ -83,3 +85,90 @@ class TestVisible:
     def test_without_scopes(self):
         analysis = zrules.Rules(PARSER, []).analyze(SRC)
         assert analysis.visible(5) == []
+
+
+# ── The capsules, read as native code reads them ──
+
+NONE = 0xFFFFFFFF
+
+
+class Str(ctypes.Structure):
+    _fields_ = [("ptr", ctypes.c_void_p), ("len", ctypes.c_size_t)]
+
+    def get(self):
+        return None if not self.ptr else ctypes.string_at(self.ptr, self.len).decode()
+
+
+class Span(ctypes.Structure):
+    _fields_ = [("start", ctypes.c_uint32), ("end", ctypes.c_uint32)]
+
+
+class SymbolView(ctypes.Structure):
+    _fields_ = [
+        ("name", Str), ("namespace", Str), ("type", Str), ("origin_key", Str), ("origin_node", ctypes.c_uint32),
+        ("module_key", Str), ("node", ctypes.c_uint32), ("def_", Span), ("scope", ctypes.c_uint32), ("owns", ctypes.c_uint32),
+        ("uses_start", ctypes.c_uint32), ("uses_len", ctypes.c_uint32), ("flags", ctypes.c_uint32),
+    ]
+
+
+class AnalysisView(ctypes.Structure):
+    _fields_ = [
+        ("abi", ctypes.c_uint32), ("symbol_count", ctypes.c_uint32), ("symbols", ctypes.POINTER(SymbolView)),
+        ("uses", ctypes.POINTER(Span)), ("use_nodes", ctypes.POINTER(ctypes.c_uint32)),
+    ]
+
+
+MATCH = ctypes.CFUNCTYPE(ctypes.c_int64, ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32))
+
+
+class SelectorView(ctypes.Structure):
+    _fields_ = [("abi", ctypes.c_uint32), ("ctx", ctypes.c_void_p), ("match", MATCH)]
+
+
+GetPointer = ctypes.pythonapi.PyCapsule_GetPointer
+GetPointer.restype = ctypes.c_void_p
+GetPointer.argtypes = [ctypes.py_object, ctypes.c_char_p]
+
+
+def opt(v):
+    return None if v == NONE else v
+
+
+class TestCapsules:
+    def test_analysis(self):
+        project = RULES.analyze_project({"lib": "struct P { a: int; }\nfn f(x: int) -> P { return P(x); }\n", "main": "from lib import f;\nlet p = f(1);\nprint(p.a);\n"})
+        for key in ("lib", "main"):
+            analysis = project.file(key)
+            capsule = analysis.capsule
+            view = AnalysisView.from_address(GetPointer(capsule, b"zrules.analysis.v1"))
+            assert view.abi == 1 and view.symbol_count == len(analysis.symbols)
+            for i, s in enumerate(analysis.symbols):
+                v = view.symbols[i]
+                assert v.name.get() == s.name and v.namespace.get() == s.namespace
+                assert v.type.get() == s.type
+                assert opt(v.node) == s.node and ((v.def_.start, v.def_.end) if s.node is not None else None) == s.span
+                assert opt(v.scope) == s.scope and opt(v.owns) == s.owns
+                assert bool(v.flags & 1) == s.builtin
+                uses = [(view.uses[v.uses_start + k].start, view.uses[v.uses_start + k].end) for k in range(v.uses_len)]
+                assert uses == [tuple(u) for u in s.use_spans]
+                assert [view.use_nodes[v.uses_start + k] for k in range(v.uses_len)] == list(s.uses)
+                origin = (v.origin_key.get(), v.origin_node) if v.origin_key.get() is not None else None
+                assert origin == (tuple(s.origin) if s.origin else None)
+        # (the capsule keeps its analysis alive)
+        capsule = RULES.analyze("let a = 1;").capsule
+        view = AnalysisView.from_address(GetPointer(capsule, b"zrules.analysis.v1"))
+        assert "a" in [view.symbols[i].name.get() for i in range(view.symbol_count)]
+
+    def test_selector(self):
+        tree = PARSER.parse_tree(SRC)
+        sel = zrules.Selector(PARSER, "funcdef > .name, let_stmt > .name")
+        capsule = sel.capsule
+        view = SelectorView.from_address(GetPointer(capsule, b"zrules.selector.v1"))
+        assert view.abi == 1
+        tree_view = GetPointer(tree.capsule, b"zgram.tree.v1")
+        out = (ctypes.c_uint32 * len(tree))()
+        n = view.match(view.ctx, tree_view, out)
+        assert list(out[:n]) == sel.match(tree)
+        # a tree of another grammar: -2
+        other = zgram.compile("x = 'x'").parse_tree("x")
+        assert view.match(view.ctx, GetPointer(other.capsule, b"zgram.tree.v1"), out) == -2

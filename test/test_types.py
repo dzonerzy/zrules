@@ -331,9 +331,24 @@ class TestUnknownTypes:
     def test_unknown_and_any_are_not_checked(self):
         assert problems('let a: unknown = 1; let b: any = "s"; let c: int = a;', make(basic=typed.TYPES["basic"] + ("unknown", "any"))) == []
 
+    def test_basic_type_names_are_types(self):
+        # like a struct's name, a basic type's name stands for the type
+        types_of = {s.name: s.type for s in RULES.analyze("struct P { a: int; }").symbols}
+        assert types_of["int"] == "type[int]" and types_of["float"] == "type[float]"
+        assert types_of["P"] == "type[P]"
+
 
 class TestProject:
     LIB = "struct Point { x: int; y: int; }\nfn make(v: int) -> Point { return Point(v, v); }\nlet limit: int = 10;\n"
+
+    def test_an_imported_name_used_as_a_type_without_its_definition(self):
+        # checked alone, or with the module missing: Point may well be a type
+        main = "from lib import Point;\nfn f(p: Point) -> int { return 1; }\n"
+        assert RULES.check(main) == []
+        project = RULES.analyze_project({"main": main})
+        assert [d.code for d in project.file("main").diagnostics] == ["no-module"]
+        # a name known not to be a type still is reported
+        assert [d.code for d in RULES.check("let x = 1;\nlet y: x = 2;\n")] == ["unknown-type"]
 
     def test_types_cross_named_imports(self):
         project = RULES.analyze_project(

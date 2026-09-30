@@ -14,6 +14,7 @@ const selector = @import("selector.zig");
 const scopes_mod = @import("scopes.zig");
 const types_mod = @import("types.zig");
 const flow_mod = @import("flow.zig");
+const native_abi = @import("native_abi.zig");
 const Tree = tree_mod.Tree;
 const Selector = selector.Selector;
 const NONE = tree_mod.NONE;
@@ -684,6 +685,80 @@ const AnalysisData = struct {
     checker: ?*const types_mod.Checker = null,
     typed_result: usize = 0,
     type_share: ?*TypeShare = null,
+    /// The symbols for native code (Analysis.capsule), once asked for
+    view: ?*native_abi.AnalysisView = null,
+
+    /// The symbol table as native_abi.AnalysisView, built once in the
+    /// arena. Needs the GIL (it reads the project's keys).
+    fn nativeView(self: *AnalysisData) !*const native_abi.AnalysisView {
+        if (self.view) |v| return v;
+        const arena = self.arena.allocator();
+        var n_syms: usize = 0;
+        var n_uses: usize = 0;
+        for (self.results) |result| {
+            n_syms += result.result.symbols.items.len;
+            for (result.result.symbols.items) |sym| n_uses += sym.uses.len;
+        }
+        const syms = try arena.alloc(native_abi.SymbolView, n_syms);
+        const uses = try arena.alloc(native_abi.Span, n_uses);
+        const use_nodes = try arena.alloc(u32, n_uses);
+        var si: usize = 0;
+        var ui: u32 = 0;
+        for (self.results, 0..) |result, r| {
+            for (result.result.symbols.items, 0..) |sym, index| {
+                var v = native_abi.SymbolView{
+                    .name = .{ .ptr = sym.name.ptr, .len = sym.name.len },
+                    .namespace = .{ .ptr = result.namespace.ptr, .len = result.namespace.len },
+                    .node = sym.node,
+                    .scope = sym.scope,
+                    .owns = sym.owns,
+                    .uses_start = ui,
+                    .uses_len = @intCast(sym.uses.len),
+                    .flags = if (sym.node == NONE and sym.origin_file == NONE) native_abi.SYMBOL_BUILTIN else 0,
+                };
+                if (sym.node != NONE) v.def = .{ .start = self.nodes[sym.node].text_start, .end = self.nodes[sym.node].text_end };
+                if (sym.origin_file != NONE and sym.origin_file < self.keys.len) {
+                    v.origin_key = keyStr(self.keys[sym.origin_file]);
+                    v.origin_node = sym.origin_node;
+                }
+                if (sym.module != NONE and sym.module < self.keys.len) v.module_key = keyStr(self.keys[sym.module]);
+                if (self.checker) |checker| {
+                    if (r == self.typed_result) {
+                        const id = checker.knownSymbol(index);
+                        if (id != types_mod.UNKNOWN) {
+                            if (self.type_share) |share| {
+                                const text = try share.table.format(arena, id);
+                                v.type = .{ .ptr = text.ptr, .len = text.len };
+                            }
+                        }
+                    }
+                }
+                for (sym.uses) |use| {
+                    uses[ui] = .{ .start = self.nodes[use].text_start, .end = self.nodes[use].text_end };
+                    use_nodes[ui] = use;
+                    ui += 1;
+                }
+                syms[si] = v;
+                si += 1;
+            }
+        }
+        const view = try arena.create(native_abi.AnalysisView);
+        view.* = .{ .symbol_count = @intCast(n_syms), .symbols = syms.ptr, .uses = uses.ptr, .use_nodes = use_nodes.ptr };
+        self.view = view;
+        return view;
+    }
+
+    /// A project key as a Str: a str's UTF-8 (kept alive by the key share);
+    /// none for any other key object.
+    fn keyStr(key: *PyObject) native_abi.Str {
+        if (!py.PyUnicode_Check(key)) return .{};
+        var len: py.Py_ssize_t = 0;
+        const ptr = py.c.PyUnicode_AsUTF8AndSize(key, &len) orelse {
+            py.c.PyErr_Clear();
+            return .{};
+        };
+        return .{ .ptr = ptr, .len = @intCast(len) };
+    }
 
     /// The spelling of a type id, as a new str; None for unknown.
     fn typeText(self: *const AnalysisData, id: types_mod.TypeId) ?*PyObject {
@@ -895,6 +970,28 @@ const Analysis = struct {
         return .{ .value = none() };
     }
 
+    fn capsuleFree(capsule: ?*PyObject) callconv(.c) void {
+        const owner: ?*PyObject = @ptrCast(@alignCast(py.c.PyCapsule_GetContext(capsule)));
+        if (owner) |obj| py.Py_DecRef(obj);
+    }
+
+    /// A PyCapsule "zrules.analysis.v1" pointing to a native_abi.AnalysisView
+    /// of the symbols, for native code. The capsule keeps the Analysis alive.
+    pub fn get_capsule(const_self: *const Analysis) pyoz.Signature(?*PyObject, "object") {
+        const self: *Analysis = @constCast(const_self);
+        const view: *const native_abi.AnalysisView = if (self._data) |data|
+            data.nativeView() catch return .{ .value = oomObject() }
+        else
+            &empty_view;
+        const capsule = py.c.PyCapsule_New(@constCast(view), native_abi.ANALYSIS_CAPSULE, &capsuleFree) orelse return .{ .value = null };
+        const owner = Module.selfObject(Analysis, self);
+        py.Py_IncRef(owner);
+        _ = py.c.PyCapsule_SetContext(capsule, owner);
+        return .{ .value = capsule };
+    }
+
+    const empty_view = native_abi.AnalysisView{};
+
     /// The Symbols visible at a byte offset of the source: what a name
     /// written there could refer to (innermost scope first, an inner name
     /// hiding an outer one, builtins and imported names last).
@@ -947,6 +1044,8 @@ const SelectorObject = struct {
     _arena: ?*std.heap.ArenaAllocator = null,
     _names: selector.Names = .{ .rules = &.{}, .fields = &.{}, .actions = &.{} },
     _selectors: []const selector.Selector = &.{},
+    /// What `capsule` points to
+    _view: native_abi.SelectorView = undefined,
 
     pub fn __new__(args: pyoz.Args(struct { parser: *PyObject, selector: *PyObject })) ?SelectorObject {
         const arena = allocator.create(std.heap.ArenaAllocator) catch {
@@ -987,6 +1086,63 @@ const SelectorObject = struct {
         self._arena = null;
     }
 
+    /// Write the indices of the nodes of `view` that match into `out` (room
+    /// for every node), in source order: how many; -1 out of memory; -2 the
+    /// tree is from another grammar. Needs no GIL.
+    fn matchInto(self: *const SelectorObject, view: *const tree_mod.TreeView, out: [*]u32) i64 {
+        var same = view.rule_count == self._names.rules.len and view.field_count == self._names.fields.len;
+        if (same) {
+            for (self._names.rules, 0..) |name, i| same = same and std.mem.eql(u8, name, view.rule_names.?[i].slice());
+        }
+        if (!same) return -2;
+        const nodes: []const tree_mod.FlatNode = if (view.nodes) |n| n[0..view.node_count] else &.{};
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const tree = Tree{
+            .nodes = nodes,
+            .input = if (view.input) |p| p[0..view.input_len] else "",
+            .parents = Tree.computeParents(arena.allocator(), nodes) catch return -1,
+        };
+        var found: usize = 0;
+        for (nodes, 0..) |node, i| {
+            for (self._selectors) |*sel| {
+                // (what the last part names, before the whole selector)
+                const last = sel.compounds[sel.compounds.len - 1];
+                if (last.rules) |rules| {
+                    if (node.ruleId() >= rules.len or !rules[node.ruleId()]) continue;
+                }
+                if (last.field != 0 and node.fieldId() != last.field) continue;
+                if (!sel.matches(&tree, @intCast(i), null)) continue;
+                out[found] = @intCast(i);
+                found += 1;
+                break;
+            }
+        }
+        return @intCast(found);
+    }
+
+    fn nativeMatch(ctx: *const anyopaque, view: *const tree_mod.TreeView, out: [*]u32) callconv(.c) i64 {
+        const self: *const SelectorObject = @ptrCast(@alignCast(ctx));
+        return self.matchInto(view, out);
+    }
+
+    fn capsuleFree(capsule: ?*PyObject) callconv(.c) void {
+        const owner: ?*PyObject = @ptrCast(@alignCast(py.c.PyCapsule_GetContext(capsule)));
+        if (owner) |obj| py.Py_DecRef(obj);
+    }
+
+    /// A PyCapsule "zrules.selector.v1" pointing to a native_abi.SelectorView:
+    /// the match function for native code. The capsule keeps the selector alive.
+    pub fn get_capsule(const_self: *const SelectorObject) pyoz.Signature(?*PyObject, "object") {
+        const self: *SelectorObject = @constCast(const_self);
+        self._view = .{ .ctx = self, .match = &nativeMatch };
+        const capsule = py.c.PyCapsule_New(&self._view, native_abi.SELECTOR_CAPSULE, &capsuleFree) orelse return .{ .value = null };
+        const owner = Module.selfObject(SelectorObject, self);
+        py.Py_IncRef(owner);
+        _ = py.c.PyCapsule_SetContext(capsule, owner);
+        return .{ .value = capsule };
+    }
+
     /// The indices of the nodes that match, in source order.
     pub fn match(self: *const SelectorObject, source: *PyObject) pyoz.Signature(?*PyObject, "list[int]") {
         const tree_obj = (if (py.c.PyObject_HasAttrString(source, "capsule") != 0) blk: {
@@ -1005,33 +1161,17 @@ const SelectorObject = struct {
             raise(py.PyExc_RuntimeError(), "this zrules reads zgram trees with TREE_ABI {d}, but the tree has {d}: upgrade zrules or zgram", .{ tree_mod.TREE_ABI, view.abi });
             return .{ .value = null };
         }
-        var same = view.rule_count == self._names.rules.len and view.field_count == self._names.fields.len;
-        if (same) {
-            for (self._names.rules, 0..) |name, i| same = same and std.mem.eql(u8, name, view.rule_names.?[i].slice());
-        }
-        if (!same) {
+        const out = allocator.alloc(u32, view.node_count) catch return .{ .value = oomObject() };
+        defer allocator.free(out);
+        const n = self.matchInto(view, out.ptr);
+        if (n == -2) {
             raise(py.PyExc_ValueError(), "the tree was parsed with a different grammar than the selector was compiled against", .{});
             return .{ .value = null };
         }
-
-        var arena = std.heap.ArenaAllocator.init(allocator);
-        defer arena.deinit();
-        const nodes: []const tree_mod.FlatNode = if (view.nodes) |n| n[0..view.node_count] else &.{};
-        const tree = Tree{
-            .nodes = nodes,
-            .input = if (view.input) |p| p[0..view.input_len] else "",
-            .parents = Tree.computeParents(arena.allocator(), nodes) catch return .{ .value = oomObject() },
-        };
-        var found: std.ArrayList(u32) = .empty;
-        for (0..nodes.len) |i| {
-            for (self._selectors) |*sel| {
-                if (!sel.matches(&tree, @intCast(i), null)) continue;
-                found.append(arena.allocator(), @intCast(i)) catch return .{ .value = oomObject() };
-                break;
-            }
-        }
-        const list = py.c.PyList_New(@intCast(found.items.len)) orelse return .{ .value = null };
-        for (found.items, 0..) |node, i| {
+        if (n < 0) return .{ .value = oomObject() };
+        const found = out[0..@intCast(n)];
+        const list = py.c.PyList_New(@intCast(found.len)) orelse return .{ .value = null };
+        for (found, 0..) |node, i| {
             const item = py.c.PyLong_FromUnsignedLong(node) orelse {
                 py.Py_DecRef(list);
                 return .{ .value = null };

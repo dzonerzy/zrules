@@ -849,6 +849,12 @@ pub const Checker = struct {
             .type_name => {
                 const text = t.text(node);
                 if (try self.namedType(self.names.symbolOf(node), text)) |id| return id;
+                // A name whose type isn't known can't be judged: an imported
+                // name whose definition isn't visible (a file checked alone,
+                // a module that can't be found) may well be a type
+                if (self.names.symbolOf(node)) |s| {
+                    if (try self.symbolType(s) == UNKNOWN) return UNKNOWN;
+                }
                 // A use that resolved to nothing is already an undefined name
                 const already_reported = self.names.symbolOf(node) == null and std.sort.binarySearch(u32, self.in.uses, node, struct {
                     fn order(a: u32, b: u32) std.math.Order {
@@ -899,7 +905,16 @@ pub const Checker = struct {
             if (sym.origin_file >= self.others.len) return UNKNOWN;
             return self.others[sym.origin_file].definitionType(sym.origin_node);
         }
-        if (sym.node == NONE) return self.builtin_types.get(sym.name) orelse UNKNOWN;
+        if (sym.node == NONE) {
+            if (self.builtin_types.get(sym.name)) |t| return t;
+            // A basic type's name stands for the type, as a struct's does
+            // (not `unknown` and `any`, which mean "not checked")
+            const unchecked = std.mem.eql(u8, sym.name, "unknown") or std.mem.eql(u8, sym.name, "any");
+            if (!unchecked) {
+                if (self.table.basicNamed(sym.name)) |basic| return self.table.generic("type", &.{basic});
+            }
+            return UNKNOWN;
+        }
         return self.declarationType(sym.node);
     }
 

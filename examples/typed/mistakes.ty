@@ -1,0 +1,22 @@
+from geometry import Point, origin, sum, area;
+
+fn describe(p: Point) -> str {
+    if p.x == 0 {
+        return "on the y axis";
+    }
+}
+
+fn scale(p: Point, factor: float, factor: int) -> Point {
+    let result: Point;
+    if factor > 1 {
+        result = Point(p.x * factor, p.y * factor);
+    }
+    return result;
+    print("scaled");
+}
+
+let start = origin();
+let moved: Point = start.plus(1);
+let total: int = sum([start.x, moved.z]);
+let name: str = describe(start, moved) + 1;
+break;

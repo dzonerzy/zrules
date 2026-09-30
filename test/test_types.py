@@ -463,6 +463,13 @@ class TestOptions:
         with pytest.raises(TypeError, match="dict"):
             make(names=("bool",))
 
+    def test_coercions_chain_and_may_go_in_circles(self):
+        chain = make(basic=typed.TYPES["basic"] + ("number",), coerce={"int": "float", "float": "number"})
+        assert problems("fn f(n: number) { } f(1); f(1.5); let i: int = 1.5;", chain)[0][1] == "expected 'int', got 'float'"
+        assert len(problems("fn f(n: number) { } f(1); f(1.5); let i: int = 1.5;", chain)) == 1
+        circle = make(coerce={"int": "float", "float": "int"})
+        assert messages('let i: int = 1.5; let f: float = 1; let s: str = 1;', circle) == ["expected 'str', got 'int'"]
+
     def test_function_types_in_options(self):
         rules = make(builtins={"apply": "fn(fn(int) -> int, int) -> int"}, scope_options={"builtins": ("apply",)})
         source = "fn inc(v: int) -> int { return v + 1; } fn name(v: str) -> str { return v; } let r = apply(inc, 1); apply(name, 1);"

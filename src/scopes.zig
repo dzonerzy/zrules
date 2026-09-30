@@ -86,6 +86,10 @@ pub const Options = struct {
     /// Names may come from somewhere this analysis can't see (a wildcard
     /// import of a file that isn't available): don't report undefined ones
     assume_defined: bool = false,
+    /// Nodes evaluated in the scope outside the one they are written in (the
+    /// bounds of a `for`, a parameter's default value): names in them are
+    /// looked up from there
+    outside: []const u32 = &.{},
 };
 
 pub const Result = struct {
@@ -138,8 +142,14 @@ pub fn analyze(
         const is_scope = try arena.alloc(bool, n_nodes);
         @memset(is_scope, false);
         for (scopes) |s| is_scope[s] = true;
-        for (above, t.parents) |*slot, parent| {
+        // An `outside` node, and what is in it, belongs to the scope outside
+        // the one it is written in (its descendants inherit that)
+        const lifted = try arena.alloc(bool, n_nodes);
+        @memset(lifted, false);
+        for (options.outside) |s| lifted[s] = true;
+        for (above, t.parents, lifted) |*slot, parent, lift| {
             slot.* = if (parent == NONE) NONE else if (is_scope[parent]) parent else above[parent];
+            if (lift and slot.* != NONE) slot.* = above[slot.*];
         }
     }
 

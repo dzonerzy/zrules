@@ -208,8 +208,13 @@ pub const Analysis = struct {
         // Followed: declared without a value, or defined by an assignment
         for (self.in.variables) |decl| {
             if (self.child(decl, labels.value) != NONE) continue;
-            const name = self.child(decl, labels.name);
-            try self.follow(names, symbol_bit, function_of, if (name != NONE) name else decl);
+            var it = self.labelled(decl, labels.name);
+            var any = false;
+            while (it.next()) |name| {
+                any = true;
+                try self.follow(names, symbol_bit, function_of, name);
+            }
+            if (!any) try self.follow(names, symbol_bit, function_of, decl);
         }
         // In `a.b`, neither the whole nor `b` is a variable
         const is_member = try self.arena.alloc(bool, n);
@@ -218,15 +223,27 @@ pub const Analysis = struct {
             is_member[m.node] = true;
             is_member[m.name] = true;
         }
-        const targets = try self.arena.alloc(u32, self.in.assigns.len);
-        for (self.in.assigns, targets) |node, *slot| {
-            slot.* = self.targetOf(names, is_member, node);
-            if (slot.* != NONE) try self.follow(names, symbol_bit, function_of, slot.*);
+        // The names given a value, each with the assignment it is in (`a, b = 1, 2` has two)
+        const Target = struct { node: u32, assign: u32 };
+        var targets: std.ArrayList(Target) = .empty;
+        for (self.in.assigns) |node| {
+            var it = self.labelled(node, labels.target);
+            var any = false;
+            while (it.next()) |written| {
+                any = true;
+                const target = self.targetOf(names, is_member, written);
+                if (target != NONE) try targets.append(self.arena, .{ .node = target, .assign = node });
+            }
+            if (any) continue;
+            const written = self.child(node, labels.name);
+            const target = if (written != NONE) self.targetOf(names, is_member, written) else NONE;
+            if (target != NONE) try targets.append(self.arena, .{ .node = target, .assign = node });
         }
+        for (targets.items) |target| try self.follow(names, symbol_bit, function_of, target.node);
         // Given a value by another function than the one that declares it:
         // when that happens is not known, so it is not followed after all
-        for (targets) |target| {
-            if (target == NONE) continue;
+        for (targets.items) |entry| {
+            const target = entry.node;
             const sym = names.symbolOf(target).?;
             const symbol = names.symbols.items[sym];
             if (symbol.node == NONE or function_of[target] != function_of[symbol.node]) symbol_bit[sym] = NONE;
@@ -243,38 +260,69 @@ pub const Analysis = struct {
         // A node that defines a name (again) doesn't read it
         for (self.in.definitions) |d| self.bit[d.node] = NONE;
 
-        for (self.in.assigns, targets) |node, target| {
-            if (target == NONE) continue;
+        for (targets.items) |entry| {
+            const target = entry.node;
             const sym = names.symbolOf(target).?;
             if (symbol_bit[sym] == NONE) continue;
             self.bit[target] = symbol_bit[sym];
             self.flags[target].assign = true;
-            try self.effect.put(self.arena, target, t.end(node));
+            try self.effect.put(self.arena, target, t.end(entry.assign));
         }
         // A declaration with a value (a second one, of a followed name) gives it
         for (self.in.variables) |decl| {
             if (self.child(decl, labels.value) == NONE) continue;
-            var name = self.child(decl, labels.name);
-            if (name == NONE) name = decl;
-            const sym = names.symbolOf(name) orelse continue;
-            if (symbol_bit[sym] == NONE or function_of[name] != function_of[names.symbols.items[sym].node]) continue;
-            self.bit[name] = symbol_bit[sym];
-            self.flags[name].assign = true;
-            try self.effect.put(self.arena, name, t.end(decl));
+            var it = self.labelled(decl, labels.name);
+            var any = false;
+            while (it.next()) |name| {
+                any = true;
+                try self.gives(names, symbol_bit, function_of, name, t.end(decl));
+            }
+            if (!any) try self.gives(names, symbol_bit, function_of, decl, t.end(decl));
         }
     }
 
-    /// The name an assignment gives a value to: its `target` (or `name`)
-    /// child, through wrappers, if that is a name and not `a.b` or `a[i]`.
-    fn targetOf(self: *const Analysis, names: *const scopes.Result, is_member: []const bool, node: u32) u32 {
+    /// The declaration of `name` gives it its value, from node index `at` on.
+    fn gives(self: *Analysis, names: *const scopes.Result, symbol_bit: []const u32, function_of: []const u32, name: u32, at: u32) Error!void {
+        const sym = names.symbolOf(name) orelse return;
+        if (symbol_bit[sym] == NONE or function_of[name] != function_of[names.symbols.items[sym].node]) return;
+        self.bit[name] = symbol_bit[sym];
+        self.flags[name].assign = true;
+        try self.effect.put(self.arena, name, at);
+    }
+
+    const Labelled = struct {
+        tree: *const Tree,
+        field: u8,
+        at: u32,
+        stop: u32,
+
+        fn next(self: *Labelled) ?u32 {
+            if (self.field == 0) return null;
+            while (self.at < self.stop) {
+                const c = self.at;
+                self.at = self.tree.end(c);
+                if (self.tree.nodes[c].fieldId() == self.field) return c;
+            }
+            return null;
+        }
+    };
+
+    /// The children of `node` labelled `field`, in order.
+    fn labelled(self: *const Analysis, node: u32, field: u8) Labelled {
+        return .{ .tree = self.tree, .field = field, .at = node + 1, .stop = self.tree.end(node) };
+    }
+
+    /// The name that `written` (the target of an assignment) gives a value
+    /// to: itself, through pass-through nodes, if that is a name and not `a.b` or `a[i]`.
+    fn targetOf(self: *const Analysis, names: *const scopes.Result, is_member: []const bool, written: u32) u32 {
         const t = self.tree;
-        var target = self.child(node, self.in.labels.target);
-        if (target == NONE) target = self.child(node, self.in.labels.name);
-        if (target == NONE) return NONE;
+        var target = written;
         while (true) {
             if (names.symbolOf(target) != null) break;
             const inner = target + 1;
             if (inner >= t.end(target) or t.end(inner) != t.end(target)) return NONE;
+            // A wrapper adds nothing to the text: `f()` is not `f`
+            if (t.nodes[inner].text_start != t.nodes[target].text_start or t.nodes[inner].text_end != t.nodes[target].text_end) return NONE;
             target = inner;
         }
         return if (is_member[target]) NONE else target;

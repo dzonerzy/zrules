@@ -38,6 +38,8 @@ program.z:1:14: error: 'break' outside loop [break-outside-loop]
       |              ^^^^^^
 ```
 
+Every option, class member and diagnostic code is listed in the [reference](docs/reference.md).
+
 ## Installation
 
 ```bash
@@ -109,6 +111,7 @@ scopes(
 - **Scopes nest.** A definition belongs to the nearest scope node above it; text outside every scope node is the global scope. A use is resolved through the scopes above it, innermost first.
 - **`define_outer`** is for a name that sits inside the node whose scope it does not belong to: a function's own name is inside the `FuncDef` node but is defined in the scope around the function.
 - **Order.** Within one scope a definition is visible from the end of its name on, so `print(x); let x = 1;` is an error. `hoist` lifts that for definitions such as functions; `after` tightens it to the end of the parent node, so `let a = a;` does not see the new `a`. A use in a nested scope sees every definition of the scopes around it, wherever it appears. `ordered=False` turns ordering off.
+- **`outside`** is for a part of a scope node that is evaluated before the scope exists: the bounds of `for i = i, 10`, a parameter's default value. Names in a node selected by `outside="For > .bounds"` are looked up from the scope outside the one they are written in.
 - **A node that is a definition is not also a use**, so `use="Name"` can simply select every name.
 
 | Option | Default | |
@@ -293,7 +296,7 @@ Only `sequences` is required; every other option adds to what is understood.
 
 - **Unreachable code** (`unreachable`, a warning by default): the first statement of a sequence that no path gets to, after a `return` or `break`, after a branch whose arms all leave, after a loop that never ends. It is reported once per sequence. A function written after a `return` is not dead code: it is a definition.
 - **Missing return** (`missing-return`): a `must_return` function whose end some path reaches. It is reported on the function's `name` child.
-- **Used before it has a value** (`unassigned`): a variable that is declared without a value (a `variables` node with no `value` child), or defined by an assignment (the `target` of an `assigns` node is its definition, as in languages without declarations), is followed from the start of its function. A use on a path where it has no value yet is an error, worded "is used" when no path gives it one and "may be used" when only some do. A variable is reported once. This part reads the names a `scopes()` rule resolved.
+- **Used before it has a value** (`unassigned`): a variable that is declared without a value (a `variables` node with no `value` child), or defined by an assignment (the `target` of an `assigns` node is its definition, as in languages without declarations), is followed from the start of its function. A use on a path where it has no value yet is an error, worded "is used" when no path gives it one and "may be used" when only some do. A variable is reported once. A declaration or an assignment may have several `name` / `target` children (`local a, b`, `a, b = 1, 2`). This part reads the names a `scopes()` rule resolved (`namespace=` says which, when there are several).
 - **Branches.** The arms of a branch are its child sequences, or what `arms=` selects; everything else in it (the condition) always runs. A branch covers every case only if one of its arms is an `otherwise` arm, or a nested branch (`else if`). Without one, the path that takes no arm counts too.
 - **Loops.** The body of a loop is its first child sequence; what comes before it (the condition) runs at least once, what comes after it (the step of a `for`, the condition of a `do ... while`) after each iteration. What a loop body gives a value to may not have one after the loop, unless the loop is `at_least_once`.
 - **Functions** are separate: a use inside a nested function of a variable of the enclosing one is not judged (when the nested function runs is not known), and a variable that another function assigns is not followed at all.
@@ -325,6 +328,7 @@ The function receives the zgram `Node` and a context:
 |---|---|
 | `ctx.error(node, message, code=None)` | report an error; also `ctx.warning` and `ctx.note` |
 | `ctx.resolve(node)` | the `Symbol` a node defines or uses, or `None` |
+| `ctx.type_of(node)` | the type `types()` found for a node, as text, or `None` |
 | `ctx.tree`, `ctx.symbols` | the tree being checked and its symbols |
 
 `node` is a `Node`, a node index, an AST object, or a `(start, end)` span. Custom rules run after the declarative rules and `scopes()`, so the symbols are complete. `rules.add(selector, function)` and `custom(selector, function)` in the rule list do the same as the decorator. An exception raised by the function propagates out of `check()`.
@@ -370,6 +374,28 @@ bad.tiny:3:1: error: 'break' outside loop [break-outside-loop]
     3 | break;
       | ^^^^^^
 ```
+
+## Example: a typed language
+
+[examples/typed](examples/typed) is a statically typed language with structs, methods, optionals, lists and imports between files. Its whole front end after parsing is about a hundred lines of rule options: structure, names, types and flow.
+
+```
+$ python examples/typed/typedlang.py geometry.ty mistakes.ty
+mistakes.ty:1:42: error: module 'geometry' has no 'area' [no-export]
+mistakes.ty:3:4: error: 'describe' may end without returning a value [missing-return]
+mistakes.ty:14:12: error: 'result' may be used before it has a value [unassigned]
+mistakes.ty:15:5: warning: unreachable code [unreachable]
+mistakes.ty:19:31: error: argument 1 of start.plus(): expected 'Point', got 'int' [bad-argument]
+mistakes.ty:20:38: error: 'Point' has no field 'z' [no-field]
+mistakes.ty:21:17: error: operator '+' cannot be applied to 'str' and 'int' [bad-operand]
+...
+```
+
+## Example: a real language
+
+[examples/lua](examples/lua) checks Lua 5.4: a complete grammar in zgram, and in zrules the errors `luac` reports beyond syntax (`break` outside a loop, `...` outside a vararg function, assignment to a `<const>` variable, `goto` without a visible label, duplicate labels) plus a linter's warnings (unused and shadowed locals, locals read before they are given a value, unreachable code).
+
+The test suite runs it over the Lua code shipped with nmap and sysdig when they are installed: 830 files and 7 MB of code in production use. Every file parses, nothing in them is reported as an error, and the warnings that were checked by hand are real (code after an `if` whose branches all return, locals that are never read).
 
 ## Building from source
 

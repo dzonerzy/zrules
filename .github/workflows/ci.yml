@@ -86,6 +86,11 @@ jobs:
               shell: bash
               run: python -m pip install --no-deps dist/*.whl && python -m pip install pytest pytest-timeout
 
+            # Real Lua code for the examples/lua test (it is skipped without)
+            - name: Install a Lua corpus
+              if: runner.os == 'Linux'
+              run: sudo apt-get update -q && sudo apt-get install -y -q nmap
+
             - name: Run tests
               timeout-minutes: 10
               run: python -m pytest test -v -o faulthandler_timeout=120 --timeout=300

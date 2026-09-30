@@ -935,17 +935,25 @@ pub const Checker = struct {
 
     /// Can a value of type `from` be used where `to` is expected?
     pub fn assignable(self: *const Checker, from: TypeId, to: TypeId) bool {
+        return self.fits(from, to, 0);
+    }
+
+    /// `steps`: coercions taken so far (a chain can't be longer than there
+    /// are coercions, which also ends one that goes in circles)
+    fn fits(self: *const Checker, from: TypeId, to: TypeId, steps: usize) bool {
         if (from == to or from == UNKNOWN or to == UNKNOWN) return true;
         const f = self.table.get(from);
         const t = self.table.get(to);
         // T? takes nil, a T, or another optional whose inside fits
         if (t.kind == .generic and std.mem.eql(u8, t.name, "?") and t.args.len == 1) {
             if (from == self.nil_type) return true;
-            if (f.kind == .generic and std.mem.eql(u8, f.name, "?") and f.args.len == 1) return self.assignable(f.args[0], t.args[0]);
-            return self.assignable(from, t.args[0]);
+            if (f.kind == .generic and std.mem.eql(u8, f.name, "?") and f.args.len == 1) return self.fits(f.args[0], t.args[0], steps);
+            return self.fits(from, t.args[0], steps);
         }
-        for (self.coerce.items) |pair| {
-            if (pair[0] == from and (pair[1] == to or self.assignable(pair[1], to))) return true;
+        if (steps < self.coerce.items.len) {
+            for (self.coerce.items) |pair| {
+                if (pair[0] == from and (pair[1] == to or self.fits(pair[1], to, steps + 1))) return true;
+            }
         }
         if (f.kind != t.kind) return false;
         switch (f.kind) {
@@ -962,7 +970,7 @@ pub const Checker = struct {
                 for (f.args, t.args) |a, b| {
                     if (a != b and a != UNKNOWN and b != UNKNOWN) return false;
                 }
-                return self.assignable(f.ret, t.ret);
+                return self.fits(f.ret, t.ret, steps);
             },
             else => return false,
         }

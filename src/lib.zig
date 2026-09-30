@@ -162,6 +162,7 @@ fn scopes(args: pyoz.Args(struct {
     define_outer: ?*PyObject = null,
     hoist: ?*PyObject = null,
     after: ?*PyObject = null,
+    outside: ?*PyObject = null,
     builtins: ?*PyObject = null,
     ordered: ?*PyObject = null,
     namespace: ?*PyObject = null,
@@ -192,7 +193,7 @@ fn scopes(args: pyoz.Args(struct {
         .{ "on_unresolved", a.on_unresolved }, .{ "members", a.members },             .{ "member_labels", a.member_labels },
         .{ "on_no_member", a.on_no_member },   .{ "imports", a.imports },             .{ "import_all", a.import_all },
         .{ "import_labels", a.import_labels }, .{ "exports", a.exports },             .{ "on_no_module", a.on_no_module },
-        .{ "on_no_export", a.on_no_export },
+        .{ "on_no_export", a.on_no_export },   .{ "outside", a.outside },
     }) };
 }
 
@@ -365,6 +366,8 @@ const ScopeRule = struct {
     hoist: []const Selector,
     /// Definitions visible only after their parent node (the declaration) ends
     after: []const Selector,
+    /// Nodes evaluated in the scope outside the one they are written in
+    outside: []const Selector,
     /// Member accesses (`target.name`), and the field ids of those two children
     members: []const Selector,
     member_target: u8,
@@ -1277,6 +1280,7 @@ const Rules = struct {
             .use = compileSelectors(state, py.c.PyDict_GetItemString(args, "use"), "use") orelse return null,
             .hoist = compileSelectors(state, py.c.PyDict_GetItemString(args, "hoist"), "hoist") orelse return null,
             .after = compileSelectors(state, py.c.PyDict_GetItemString(args, "after"), "after") orelse return null,
+            .outside = compileSelectors(state, py.c.PyDict_GetItemString(args, "outside"), "outside") orelse return null,
             .builtins = builtins,
             .ordered = ordered,
             .levels = .{
@@ -2026,6 +2030,7 @@ const Rules = struct {
         const ScopeInput = struct {
             rule: *const ScopeRule,
             scope_nodes: []const u32,
+            outside: []const u32 = &.{},
             defs: []const scopes_mod.Definition,
             uses: []const u32,
             members: []const scopes_mod.Member,
@@ -2394,6 +2399,7 @@ const Rules = struct {
             var input = ScopeInput{
                 .rule = sr,
                 .scope_nodes = scope_nodes,
+                .outside = try self.matchAll(sr.outside),
                 .defs = defs.items,
                 .uses = kept_uses,
                 .members = members.items,
@@ -2463,6 +2469,7 @@ const Rules = struct {
                 .report_unused = sr.levels[@intFromEnum(scopes_mod.ProblemKind.unused)] != .ignore,
                 .report_shadowed = sr.levels[@intFromEnum(scopes_mod.ProblemKind.shadowed)] != .ignore,
                 .assume_defined = assume_defined,
+                .outside = input.outside,
             });
 
             for (result.symbols.items) |*sym| {
@@ -3175,7 +3182,7 @@ pub const Module = pyoz.module(.{
         pyoz.func("forbid", forbid, "forbid(selector, message=None, code=None, severity=None): no node may match `selector`."),
         pyoz.func("require", require, "require(selector, message=None, code=None, severity=None): every node matching all but the last part of `selector` must have a match of the whole selector."),
         pyoz.func("count", count, "count(selector, exactly=None, min=None, max=None, message=None, code=None, severity=None): the number of matches within the node the selector's first part matched must be in range."),
-        pyoz.func("scopes", scopes, "scopes(scope, define, use, define_outer=None, hoist=None, after=None, builtins=None, ordered=True, namespace='name', on_undefined='error', on_redefine='error', on_unused='ignore', on_shadow='ignore', on_no_member='error', members=None, member_labels=('target', 'name'), imports=None, import_all=None, import_labels=('module', 'names', 'alias'), exports=None, on_no_module='error', on_no_export='error', on_unresolved=None, messages=None, codes=None): resolve names. `scope` nodes open a scope; `define` nodes define their text as a name in the scope around them (`define_outer`: in the scope outside that one); `use` nodes must resolve to a definition. `hoist` definitions are visible before their position; `after` definitions only once their parent node has ended. `members` nodes are accesses like a.b: the child labelled name is looked up in the scope that the child labelled target names."),
+        pyoz.func("scopes", scopes, "scopes(scope, define, use, define_outer=None, hoist=None, after=None, outside=None, builtins=None, ordered=True, namespace='name', on_undefined='error', on_redefine='error', on_unused='ignore', on_shadow='ignore', on_no_member='error', members=None, member_labels=('target', 'name'), imports=None, import_all=None, import_labels=('module', 'names', 'alias'), exports=None, on_no_module='error', on_no_export='error', on_unresolved=None, messages=None, codes=None): resolve names. `scope` nodes open a scope; `define` nodes define their text as a name in the scope around them (`define_outer`: in the scope outside that one); `use` nodes must resolve to a definition. `hoist` definitions are visible before their position; `after` definitions only once their parent node has ended. `members` nodes are accesses like a.b: the child labelled name is looked up in the scope that the child labelled target names."),
         pyoz.func("custom", custom, "custom(selector, function, code=None): call function(node, ctx) for every node matching `selector`."),
         pyoz.func("types", types, "types(basic=None, coerce=None, literals=None, containers=None, names=None, type_names=None, type_args=None, optional=None, variables=None, functions=None, structs=None, binary=None, unary=None, calls=None, index=None, assigns=None, returns=None, conditions=None, operators=None, builtins=None, labels=None, namespace=None, severity='error', codes=None, ignore=None): type-check the program. Each option names the nodes that play a role (selectors), read through labelled children; see the documentation. Needs a scopes() rule for the names."),
         pyoz.func("flow", flow, "flow(sequences, functions=None, branches=None, arms=None, otherwise=None, loops=None, forever=None, at_least_once=None, exits=None, breaks=None, continues=None, must_return=None, variables=None, assigns=None, labels=None, namespace=None, on_unreachable='warning', on_missing_return='error', on_unassigned='error', messages=None, codes=None): follow the control flow. Reports code that can't be reached, `must_return` functions whose end can be, and variables (declared by `variables` without a value, or defined by `assigns`) used before they have a value on every path."),

@@ -3,9 +3,10 @@ requires = ["pyoz>=0.13.7"]
 build-backend = "pyoz.backend"
 
 [project]
-name = "zrules"
+# zsuite packages are named <name>-py on PyPI; the import name stays `zrules` (module-name below)
+name = "zrules-py"
 version = "0.1.0"
-description = "Static rules over zgram parse trees: selectors, context and uniqueness rules, diagnostics."
+description = "Static semantics for languages parsed with zgram: structural rules, scopes and symbol tables, types, control flow, native and fast."
 requires-python = ">=3.10"
 readme = "README.md"
 license = "MIT"
@@ -34,6 +35,9 @@ Changelog = "https://github.com/dzonerzy/zrules/blob/main/CHANGELOG.md"
 [tool.pyoz]
 # Path to your Zig source file
 module-path = "src/lib.zig"
+
+# Python import name (the distribution is zrules-py)
+module-name = "zrules"
 
 # Strip debug symbols in release builds
 strip = true

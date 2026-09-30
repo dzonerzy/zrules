@@ -4,7 +4,7 @@
 
 zgram tells you whether a text is well-formed. zrules tells you whether it is *valid*: `break` only inside a loop, no duplicate parameters, `len()` takes one argument. You write each check as one line; zrules runs them natively over zgram's parse tree and reports every violation as a `zgram.Diagnostic`.
 
-It covers three levels of checking: one-line structural rules, name resolution with scopes (which also gives you a symbol table), and custom rules written as Python functions. Part of zsuite (zgram, zrules, zrun, zlsp).
+It covers four levels of checking: one-line structural rules, name resolution with scopes (which also gives you a symbol table, within a file or across a project), type checking, and custom rules written as Python functions. Part of zsuite (zgram, zrules, zrun, zlsp).
 
 ```python
 import zgram
@@ -197,6 +197,76 @@ analysis.at(offset)         # the Symbol defined or used at a byte offset, or No
 
 A `Symbol` has `name`, `namespace`, `builtin`, `node` and `span` (its definition; `None` for a builtin), `scope` (the index of its scope node; `None` for the global scope), `owns` (the index of the scope it names, if it has members), `uses` / `use_spans`, and in a project `origin` and `module` (see above).
 
+## Types
+
+`types()` type-checks the program. You say which nodes play which part, and what your operators and literals mean; zrules infers the type of every expression and reports what doesn't fit. It types the names a `scopes()` rule resolves, so it needs one in the same `Rules`.
+
+```python
+NUMERIC = [("int", "int", "int"), ("float", "float", "float")]
+
+types(
+    basic=("int", "float", "str", "bool", "void", "nil"),    # the built-in type names
+    coerce={"int": "float"},                                  # an int fits where a float is expected
+    literals={"Int": "int", "Float": "float", "String": "str", "Bool": "bool", "Nil": "nil"},
+    containers={"ListLit": "list"},                           # [1, 2] is a list[int]
+    type_names="TypeName",                                    # a type written in the source
+    type_args="GenericType",                                  # list[int]: children `base` and `args`
+    optional="OptionalType",                                  # int?: wraps the type inside it
+    variables="Let, Param, Field",                            # children `name`, `type`, `value`
+    functions="FuncDef",                                      # children `name`, `params`, `returns`
+    structs="StructDef",                                      # child `name`; its scope holds the members
+    binary="Compare, Sum, Term",                              # children `left`, `op`, `right`
+    unary="Neg, Not",                                         # child `operand`
+    calls="Call",                                             # children `callee`, `args`
+    index="Index",                                            # children `target`, `index`
+    assigns="Assign",                                         # children `target`, `value`
+    returns="Return",                                         # child `value`
+    conditions="If > .cond, While > .cond",                   # must be bool
+    operators={
+        "+": NUMERIC + [("str", "str", "str")],               # (left, right, result)
+        "-": NUMERIC + [("int", "int"), ("float", "float")],  # (operand, result): unary
+        "==": [("T", "T", "bool")],                           # T: the same type on both sides
+        "not": [("bool", "bool")],
+    },
+    builtins={"print": "fn(...) -> void", "len": "fn(any) -> int"},
+)
+```
+
+Every option is optional: leave out `structs` and there are no declared types, leave out `conditions` and conditions aren't checked.
+
+- **Parts are read through labels.** A `variables` node gives its name in the child labelled `name`, its declared type in `type`, its initial value in `value`. If your grammar uses other labels, map them: `labels={"callee": "fn", "value": "init"}`. The roles are `name`, `type`, `value`, `params`, `returns`, `left`, `op`, `right`, `operand`, `callee`, `args`, `target`, `index`, `base` and `items`. A call's callee is its `callee` child, else `name`, else `target` (what zgram's `@postfix` folding produces); a unary operator without an `op` child is the text before its operand.
+- **Inference.** A variable without a declared type has the type of its value; a call has the function's result type; an operator's result comes from its table. Anything a wrapper node contains alone (parentheses, a pass-through rule) has the type of what it contains.
+- **Unknown is compatible with everything.** A parameter without a type, a function without a declared result, an operator not in the table: their type is unknown, and unknown is never an error. A program with no type annotations has no type errors, and you can add types gradually. `unknown` and `any` can be written wherever a type is, to say so explicitly.
+- **Types** are written `int`, `list[int]`, `map[str, int]`, `int?`, `fn(int, str) -> bool`, `fn(str, ...) -> void` (any number of further arguments). Generic types are told apart by name and arguments; a one-argument generic is indexed by `int` and gives its argument, a two-argument one is indexed by its first and gives its second, and indexing a `str` gives a `str`.
+- **Optional.** `T?` takes a `T`, `nil`, or another optional that fits. Members are looked up through it.
+- **Declared types.** A `structs` node declares a type named by its `name` child. The variables declared directly in its scope are its fields, the functions its methods: `p.x` and `p.scale(2)` are typed through them. Calling the type constructs it, one argument per field, in order. For type names to refer to declared types, the `scopes()` rule must resolve them: include the type-name node in its `use`. The names in `basic` are made builtins of that rule automatically.
+- **The types the checker itself relies on** (a condition is `bool`, a list index is `int`, `return;` returns `void`, `nil` fits an optional, indexing a `str`) can be renamed: `names={"bool": "Boolean", "nil": "Null"}`.
+
+| Code | Key | |
+|------|-----|---|
+| `type-mismatch` | `mismatch` | a value of the wrong type in a declaration, an assignment, a list, an index |
+| `bad-operand` | `operator` | an operator applied to types its table doesn't list |
+| `arity` | `arity` | a call with the wrong number of arguments |
+| `bad-argument` | `argument` | an argument of the wrong type |
+| `not-callable` | `not_callable` | a call of something that is not a function or a type |
+| `no-field` | `no_field` | a member the type doesn't have |
+| `bad-return` | `bad_return` | a returned value that isn't the function's declared result |
+| `bad-condition` | `condition` | a condition that isn't `bool` |
+| `unknown-type` | `unknown_type` | a type name that names no type (when the name isn't already reported as undefined) |
+| `not-indexable` | `not_indexable` | indexing something that can't be |
+
+`codes={"mismatch": "T001"}` changes a code, `ignore=("condition",)` turns a check off, `severity="warning"` downgrades them all, and `namespace=` picks the `scopes()` rule when there are several.
+
+```python
+analysis = rules.analyze(source)
+analysis.type_of(node)      # 'list[int]', or None if unknown
+analysis.symbols[0].type    # 'fn(int, int) -> int'
+```
+
+Custom rules get the same through `ctx.type_of(node)`. With `analyze_project()`, types follow imports: an imported function, variable or struct has the type its own file gives it, and a struct imported through two paths is one type.
+
+The checker has no recursion limit to run into: a chain of thousands of definitions each depending on the next, within a file or across files, is typed without deep recursion.
+
 ## Custom rules
 
 Anything the declarative rules don't cover is a Python function, called for every node matching a selector:
@@ -247,6 +317,8 @@ Each rule visits only the nodes its selector can end on, found through an index 
 | 4 structural rules | 0.4 ms |
 | 19 structural rules | 0.9 ms |
 | `scopes()` resolving 8,000 definitions and 16,000 uses (34,000 nodes) | 1.3 ms |
+| `scopes()` + `types()` on a typed program: 896 KB, 260,000 nodes, 20,000 typed declarations with calls | 31 ms |
+| `analyze_project()` on 8,000 small files importing one another, with types | 80 ms |
 
 `Symbol` objects are created only when asked for (`symbols`, `resolve()`, `at()`), so `check()` pays nothing for them.
 

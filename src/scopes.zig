@@ -96,10 +96,19 @@ pub const Result = struct {
     /// Member accesses whose target has no members known here (the caller
     /// may know better: the target may be an imported module)
     open_members: []const Member = &.{},
+    /// Name -> id, and (scope, name id) -> symbol: what `lookup` reads
+    names: std.StringHashMapUnmanaged(u32) = .empty,
+    table: std.AutoHashMapUnmanaged(u64, u32) = .empty,
 
     pub fn symbolOf(self: *const Result, node: u64) ?u32 {
         if (node >= self.by_node.len or self.by_node[node] == NONE) return null;
         return self.by_node[node];
+    }
+
+    /// The symbol `name` defined directly in `scope` (NONE = global), if any.
+    pub fn lookup(self: *const Result, scope: u32, name: []const u8) ?u32 {
+        const id = self.names.get(name) orelse return null;
+        return self.table.get(key(scope, id));
     }
 };
 
@@ -289,5 +298,5 @@ pub fn analyze(
         }
     }
 
-    return .{ .symbols = symbols, .problems = problems, .by_node = by_node, .open_members = open_members.items };
+    return .{ .symbols = symbols, .problems = problems, .by_node = by_node, .open_members = open_members.items, .names = names, .table = table };
 }

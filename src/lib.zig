@@ -12,6 +12,7 @@ const PyObject = pyoz.PyObject;
 const tree_mod = @import("tree.zig");
 const selector = @import("selector.zig");
 const scopes_mod = @import("scopes.zig");
+const types_mod = @import("types.zig");
 const Tree = tree_mod.Tree;
 const Selector = selector.Selector;
 const NONE = tree_mod.NONE;
@@ -47,7 +48,7 @@ fn utf8(obj: *PyObject, what: []const u8) ?[]const u8 {
 // Rule: what inside(), unique(), ... return
 // ============================================================================
 
-const Kind = enum(u8) { inside, unique, forbid, require, count, scopes, custom };
+const Kind = enum(u8) { inside, unique, forbid, require, count, scopes, custom, types };
 
 /// A rule as written, before it is compiled against a grammar by Rules().
 const Rule = struct {
@@ -203,9 +204,86 @@ fn custom(args: pyoz.Args(struct {
     return .{ .value = makeRule(.custom, .{ .{ "selector", a.selector }, .{ "function", a.function }, .{ "code", a.code } }) };
 }
 
+fn types(args: pyoz.Args(struct {
+    basic: ?*PyObject = null,
+    coerce: ?*PyObject = null,
+    literals: ?*PyObject = null,
+    containers: ?*PyObject = null,
+    type_names: ?*PyObject = null,
+    type_args: ?*PyObject = null,
+    optional: ?*PyObject = null,
+    variables: ?*PyObject = null,
+    functions: ?*PyObject = null,
+    structs: ?*PyObject = null,
+    binary: ?*PyObject = null,
+    unary: ?*PyObject = null,
+    calls: ?*PyObject = null,
+    index: ?*PyObject = null,
+    assigns: ?*PyObject = null,
+    returns: ?*PyObject = null,
+    conditions: ?*PyObject = null,
+    operators: ?*PyObject = null,
+    builtins: ?*PyObject = null,
+    labels: ?*PyObject = null,
+    names: ?*PyObject = null,
+    namespace: ?*PyObject = null,
+    severity: ?*PyObject = null,
+    codes: ?*PyObject = null,
+    ignore: ?*PyObject = null,
+})) pyoz.Signature(?Rule, "Rule") {
+    const a = args.value;
+    return .{ .value = makeRule(.types, .{
+        .{ "basic", a.basic },           .{ "coerce", a.coerce },         .{ "literals", a.literals },
+        .{ "type_names", a.type_names }, .{ "type_args", a.type_args },   .{ "optional", a.optional },
+        .{ "variables", a.variables },   .{ "functions", a.functions },   .{ "structs", a.structs },
+        .{ "binary", a.binary },         .{ "unary", a.unary },           .{ "calls", a.calls },
+        .{ "index", a.index },           .{ "assigns", a.assigns },       .{ "returns", a.returns },
+        .{ "conditions", a.conditions }, .{ "operators", a.operators },   .{ "builtins", a.builtins },
+        .{ "labels", a.labels },         .{ "namespace", a.namespace },   .{ "severity", a.severity },
+        .{ "codes", a.codes },           .{ "ignore", a.ignore },         .{ "containers", a.containers },
+        .{ "names", a.names },
+    }) };
+}
+
 // ============================================================================
 // Compiled rules
 // ============================================================================
+
+const type_problem_kinds = @typeInfo(types_mod.ProblemKind).@"enum".fields.len;
+
+/// A compiled types() rule
+const TypeRule = struct {
+    /// The scopes() rule whose names it types ("" = the first one)
+    namespace: []const u8,
+    literals: []const LiteralRule,
+    /// Container literals: selector -> constructor name (`list`)
+    containers: []const LiteralRule,
+    type_names: []const Selector,
+    type_args: []const Selector,
+    optionals: []const Selector,
+    variables: []const Selector,
+    functions: []const Selector,
+    structs: []const Selector,
+    binaries: []const Selector,
+    unaries: []const Selector,
+    calls: []const Selector,
+    indexes: []const Selector,
+    assigns: []const Selector,
+    returns: []const Selector,
+    conditions: []const Selector,
+    operators: []const types_mod.Operator,
+    basic: []const []const u8,
+    coerce: []const [2][]const u8,
+    builtins: []const [2][]const u8,
+    labels: types_mod.Labels,
+    names: types_mod.Names,
+    severity: []const u8,
+    /// Per types_mod.ProblemKind
+    codes: [type_problem_kinds][]const u8,
+    ignore: [type_problem_kinds]bool,
+
+    const LiteralRule = struct { selectors: []const Selector, type: []const u8 };
+};
 
 /// What to do about a kind of name problem
 const Level = enum { ignore, warning, err };
@@ -266,6 +344,8 @@ const CompiledRule = struct {
     severity: []const u8,
     /// scopes: its configuration
     scope: ?*const ScopeRule = null,
+    /// types: its configuration
+    types: ?*const TypeRule = null,
     /// custom: the Python function to call with (node, ctx); a strong reference
     callback: ?*PyObject = null,
 };
@@ -327,15 +407,21 @@ const Symbol = struct {
     _origin: ?*PyObject = null,
     /// File key, for the local name of an imported module
     _module: ?*PyObject = null,
+    /// Its type as text, with a types() rule; None when unknown
+    _type: ?*PyObject = null,
     /// list[int]: the nodes that use it, and list[(start, end)]: their spans
     _uses: ?*PyObject = null,
     _use_spans: ?*PyObject = null,
 
     pub fn __del__(self: *Symbol) void {
-        inline for (.{ "_name", "_namespace", "_uses", "_use_spans", "_origin", "_module" }) |field| {
+        inline for (.{ "_name", "_namespace", "_uses", "_use_spans", "_origin", "_module", "_type" }) |field| {
             if (@field(self, field)) |obj| py.Py_DecRef(obj);
             @field(self, field) = null;
         }
+    }
+
+    pub fn get_type(self: *const Symbol) pyoz.Signature(?*PyObject, "str | None") {
+        return .{ .value = ownedOrNone(self._type) };
     }
 
     pub fn get_origin(self: *const Symbol) pyoz.Signature(?*PyObject, "tuple[object, int] | None") {
@@ -424,6 +510,36 @@ fn nodeIndexOf(obj: *PyObject) ?i64 {
     return v;
 }
 
+/// The types of one check, shared by the analyses of its files: a type that
+/// crosses an import is the same id on both sides. Freed with the last one.
+const TypeShare = struct {
+    arena: std.heap.ArenaAllocator,
+    table: types_mod.Table,
+    refs: usize = 0,
+
+    fn release(self: *TypeShare) void {
+        self.refs -= 1;
+        if (self.refs != 0) return;
+        self.arena.deinit();
+        allocator.destroy(self);
+    }
+};
+
+/// The keys of a project's files (strong references), shared by their
+/// analyses. Freed with the last one.
+const KeyShare = struct {
+    refs: usize = 0,
+    keys: []*PyObject,
+
+    fn release(self: *KeyShare) void {
+        self.refs -= 1;
+        if (self.refs != 0) return;
+        for (self.keys) |k| py.Py_DecRef(k);
+        allocator.free(self.keys);
+        allocator.destroy(self);
+    }
+};
+
 /// What an Analysis keeps from a check: the names found by each scopes()
 /// rule, in the arena the check ran in. Symbol objects are made on demand.
 const AnalysisData = struct {
@@ -433,11 +549,32 @@ const AnalysisData = struct {
     objects: []const []?*PyObject = &.{},
     /// The tree's nodes (owned by the Tree object the Analysis references)
     nodes: []const tree_mod.FlatNode = &.{},
-    /// In a project: every file's key, by file index (strong references)
+    /// In a project: every file's key, by file index (kept alive by `key_share`)
     keys: []const *PyObject = &.{},
+    key_share: ?*KeyShare = null,
+    /// With a types() rule: the file's checker (its types are all worked
+    /// out), which scopes() result it typed, and the table its type ids
+    /// index, shared by the files of the project
+    checker: ?*const types_mod.Checker = null,
+    typed_result: usize = 0,
+    type_share: ?*TypeShare = null,
+
+    /// The spelling of a type id, as a new str; None for unknown.
+    fn typeText(self: *const AnalysisData, id: types_mod.TypeId) ?*PyObject {
+        const share = self.type_share orelse return none();
+        if (id == types_mod.UNKNOWN) return none();
+        // A scratch spelling: the table's arena is only for interned types
+        var buf: [512]u8 = undefined;
+        var fixed = std.heap.FixedBufferAllocator.init(&buf);
+        var scratch = share.table;
+        scratch.arena = fixed.allocator();
+        const text = scratch.format(id) catch return py.PyUnicode_FromStringAndSize("...", 3);
+        return py.PyUnicode_FromStringAndSize(text.ptr, @intCast(text.len));
+    }
 
     fn destroy(self: *AnalysisData) void {
-        for (self.keys) |k| py.Py_DecRef(k);
+        if (self.type_share) |share| share.release();
+        if (self.key_share) |share| share.release();
         for (self.objects) |per_result| {
             for (per_result) |o| {
                 if (o) |obj| py.Py_DecRef(obj);
@@ -484,6 +621,9 @@ const AnalysisData = struct {
         if (sym.module != NONE and sym.module < self.keys.len) {
             value._module = self.keys[sym.module];
             py.Py_IncRef(value._module.?);
+        }
+        if (self.checker) |checker| {
+            if (r == self.typed_result) value._type = self.typeText(checker.knownSymbol(index));
         }
         const obj = Module.toPy(Symbol, value) orelse {
             value.__del__();
@@ -596,6 +736,20 @@ const Analysis = struct {
         return .{ .value = self.resolveNode(node) };
     }
 
+    fn typeOfNode(self: *const Analysis, node: *PyObject) ?*PyObject {
+        const index = nodeIndexOf(node) orelse return null;
+        const data = self._data orelse return none();
+        const checker = data.checker orelse return none();
+        if (index < 0 or index > std.math.maxInt(u32)) return none();
+        return data.typeText(checker.known(@intCast(index)));
+    }
+
+    /// The type of a node, as text ("int", "list[str]", "Point"), or None
+    /// when it is unknown or the rules have no types().
+    pub fn type_of(self: *const Analysis, node: *PyObject) pyoz.Signature(?*PyObject, "str | None") {
+        return .{ .value = self.typeOfNode(node) };
+    }
+
     /// The Symbol defined or used at a byte offset of the source, or None.
     pub fn at(self: *const Analysis, offset: i64) pyoz.Signature(?*PyObject, "Symbol | None") {
         const data = self._data orelse return .{ .value = none() };
@@ -622,6 +776,8 @@ const Analysis = struct {
     pub const resolve__params__ = "node";
     pub const at__doc__: [*:0]const u8 = "The Symbol defined or used at a byte offset of the source, or None.";
     pub const at__params__ = "offset";
+    pub const type_of__doc__: [*:0]const u8 = "The type of a node as text ('int', 'list[str]', 'Point'), or None when it is unknown or the rules have no types(). `node` is a zgram Node, a node index, or an AST object built by zgram.";
+    pub const type_of__params__ = "node";
 };
 
 /// What a custom rule's function receives as its second argument. Only
@@ -694,6 +850,12 @@ const Context = struct {
     pub fn resolve(self: *const Context, node: *PyObject) pyoz.Signature(?*PyObject, "Symbol | None") {
         const a = self.analysis() orelse return .{ .value = none() };
         return .{ .value = a.resolveNode(node) };
+    }
+
+    /// The type of a node as text, or None when unknown.
+    pub fn type_of(self: *const Context, node: *PyObject) pyoz.Signature(?*PyObject, "str | None") {
+        const a = self.analysis() orelse return .{ .value = none() };
+        return .{ .value = a.typeOfNode(node) };
     }
 
     pub fn get_tree(self: *const Context) pyoz.Signature(?*PyObject, "Tree") {
@@ -1083,10 +1245,253 @@ const Rules = struct {
         return sr;
     }
 
+    /// A dict of str -> str as pairs copied into the arena; none when absent.
+    fn textPairs(state: *State, args: *PyObject, key: [*:0]const u8) ?[]const [2][]const u8 {
+        const dict = py.c.PyDict_GetItemString(args, key) orelse return &.{};
+        if (!py.PyDict_Check(dict)) {
+            raise(py.PyExc_TypeError(), "{s} must be a dict of str -> str", .{std.mem.span(key)});
+            return null;
+        }
+        const arena = state.arena.allocator();
+        var out: std.ArrayList([2][]const u8) = .empty;
+        var pos: py.Py_ssize_t = 0;
+        var k: ?*PyObject = null;
+        var v: ?*PyObject = null;
+        while (py.c.PyDict_Next(dict, &pos, &k, &v) != 0) {
+            const name = arena.dupe(u8, utf8(k.?, std.mem.span(key)) orelse return null) catch return oomPairs();
+            const value = arena.dupe(u8, utf8(v.?, std.mem.span(key)) orelse return null) catch return oomPairs();
+            out.append(arena, .{ name, value }) catch return oomPairs();
+        }
+        return out.items;
+    }
+
+    fn oomPairs() ?[]const [2][]const u8 {
+        _ = py.c.PyErr_NoMemory();
+        return null;
+    }
+
+    /// Is `text` a type as types_mod.Table.parse reads it? Raises ValueError if not.
+    fn validType(scratch: *types_mod.Table, text: []const u8, what: []const u8) bool {
+        _ = scratch.parse(text) catch |e| {
+            if (e == error.OutOfMemory) _ = py.c.PyErr_NoMemory() else raise(py.PyExc_ValueError(), "{s}: '{s}' is not a type (write int, list[int], str?, fn(int, str) -> bool)", .{ what, text });
+            return false;
+        };
+        return true;
+    }
+
+    fn oomTypes() ?*const TypeRule {
+        _ = py.c.PyErr_NoMemory();
+        return null;
+    }
+
+    fn compileTypes(state: *State, args: *PyObject) ?*const TypeRule {
+        const arena = state.arena.allocator();
+        const tr = arena.create(TypeRule) catch return oomTypes();
+        // Types are only checked for syntax here; a throwaway table does that
+        var scratch_arena = std.heap.ArenaAllocator.init(allocator);
+        defer scratch_arena.deinit();
+        var scratch = types_mod.Table.init(scratch_arena.allocator()) catch {
+            _ = py.c.PyErr_NoMemory();
+            return null;
+        };
+
+        // literals: selector -> type
+        var literals: std.ArrayList(TypeRule.LiteralRule) = .empty;
+        if (py.c.PyDict_GetItemString(args, "literals")) |dict| {
+            if (!py.PyDict_Check(dict)) {
+                raise(py.PyExc_TypeError(), "literals must be a dict of selector -> type", .{});
+                return null;
+            }
+            var pos: py.Py_ssize_t = 0;
+            var k: ?*PyObject = null;
+            var v: ?*PyObject = null;
+            while (py.c.PyDict_Next(dict, &pos, &k, &v) != 0) {
+                const selectors = compileSelectors(state, k, "literals") orelse return null;
+                const text = arena.dupe(u8, utf8(v.?, "a literal's type") orelse return null) catch return oomTypes();
+                if (!validType(&scratch, text, "literals")) return null;
+                literals.append(arena, .{ .selectors = selectors, .type = text }) catch return oomTypes();
+            }
+        }
+
+        // containers: selector -> constructor name
+        var containers: std.ArrayList(TypeRule.LiteralRule) = .empty;
+        if (py.c.PyDict_GetItemString(args, "containers")) |dict| {
+            if (!py.PyDict_Check(dict)) {
+                raise(py.PyExc_TypeError(), "containers must be a dict of selector -> name", .{});
+                return null;
+            }
+            var pos: py.Py_ssize_t = 0;
+            var k: ?*PyObject = null;
+            var v: ?*PyObject = null;
+            while (py.c.PyDict_Next(dict, &pos, &k, &v) != 0) {
+                const selectors = compileSelectors(state, k, "containers") orelse return null;
+                const name = arena.dupe(u8, utf8(v.?, "a container's name") orelse return null) catch return oomTypes();
+                containers.append(arena, .{ .selectors = selectors, .type = name }) catch return oomTypes();
+            }
+        }
+
+        // operators: op -> rows of (left, right, result), or (operand, result) for a unary one
+        var operators: std.ArrayList(types_mod.Operator) = .empty;
+        if (py.c.PyDict_GetItemString(args, "operators")) |dict| {
+            if (!py.PyDict_Check(dict)) {
+                raise(py.PyExc_TypeError(), "operators must be a dict of operator -> rows", .{});
+                return null;
+            }
+            var pos: py.Py_ssize_t = 0;
+            var k: ?*PyObject = null;
+            var v: ?*PyObject = null;
+            while (py.c.PyDict_Next(dict, &pos, &k, &v) != 0) {
+                const op = arena.dupe(u8, utf8(k.?, "an operator") orelse return null) catch return oomTypes();
+                const n_rows = py.c.PySequence_Size(v);
+                if (n_rows < 0 or py.PyUnicode_Check(v.?)) {
+                    py.c.PyErr_Clear();
+                    raise(py.PyExc_TypeError(), "operators['{s}'] must be a list of rows: (left, right, result) or (operand, result)", .{op});
+                    return null;
+                }
+                for (0..@intCast(n_rows)) |i| {
+                    const row_obj = py.c.PySequence_GetItem(v, @intCast(i)) orelse return null;
+                    defer py.Py_DecRef(row_obj);
+                    const row = strings(arena, row_obj, "an operator row", false) orelse return null;
+                    if (py.PyUnicode_Check(row_obj) or (row.len != 2 and row.len != 3)) {
+                        raise(py.PyExc_ValueError(), "operators['{s}']: a row is (left, right, result) or (operand, result)", .{op});
+                        return null;
+                    }
+                    for (row) |text| {
+                        if (!std.mem.eql(u8, text, "T") and !validType(&scratch, text, "operators")) return null;
+                    }
+                    operators.append(arena, if (row.len == 3)
+                        .{ .op = op, .left = row[0], .right = row[1], .result = row[2] }
+                    else
+                        .{ .op = op, .right = row[0], .result = row[1] }) catch return oomTypes();
+                }
+            }
+        }
+
+        const coerce = textPairs(state, args, "coerce") orelse return null;
+        for (coerce) |pair| {
+            if (!validType(&scratch, pair[0], "coerce") or !validType(&scratch, pair[1], "coerce")) return null;
+        }
+        const builtins = textPairs(state, args, "builtins") orelse return null;
+        for (builtins) |pair| {
+            if (!validType(&scratch, pair[1], "builtins")) return null;
+        }
+
+        // Which label each child is read through: its role's name, unless overridden
+        var labels = types_mod.Labels{};
+        const overrides = textPairs(state, args, "labels") orelse return null;
+        inline for (@typeInfo(types_mod.Labels).@"struct".fields) |field| {
+            var label: []const u8 = field.name;
+            for (overrides) |pair| {
+                if (std.mem.eql(u8, pair[0], field.name)) label = pair[1];
+            }
+            for (state.names.fields, 1..) |f, id| {
+                if (std.mem.eql(u8, f, label)) @field(labels, field.name) = @intCast(id);
+            }
+        }
+        for (overrides) |pair| {
+            var known = false;
+            inline for (@typeInfo(types_mod.Labels).@"struct".fields) |field| {
+                if (std.mem.eql(u8, pair[0], field.name)) known = true;
+            }
+            if (!known) {
+                raise(py.PyExc_ValueError(), "labels: unknown role '{s}'", .{pair[0]});
+                return null;
+            }
+        }
+
+        // What the language calls the types the checker itself needs
+        var type_names = types_mod.Names{};
+        for (textPairs(state, args, "names") orelse return null) |pair| {
+            var known = false;
+            inline for (@typeInfo(types_mod.Names).@"struct".fields) |field| {
+                if (std.mem.eql(u8, pair[0], field.name)) {
+                    @field(type_names, field.name) = pair[1];
+                    known = true;
+                }
+            }
+            if (!known) {
+                raise(py.PyExc_ValueError(), "names: unknown type '{s}': expected bool, void, nil, int or str", .{pair[0]});
+                return null;
+            }
+            if (!validType(&scratch, pair[1], "names")) return null;
+        }
+
+        var codes: [type_problem_kinds][]const u8 = .{
+            "type-mismatch", "bad-operand", "arity",        "bad-argument", "not-callable",
+            "no-field",      "bad-return",  "bad-condition", "unknown-type", "not-indexable",
+        };
+        var ignore: [type_problem_kinds]bool = @splat(false);
+        const kind_names = comptime blk: {
+            var names: [type_problem_kinds][]const u8 = undefined;
+            for (@typeInfo(types_mod.ProblemKind).@"enum".fields, 0..) |f, i| names[i] = f.name;
+            break :blk names;
+        };
+        for (textPairs(state, args, "codes") orelse return null) |pair| {
+            const at = for (kind_names, 0..) |name, i| {
+                if (std.mem.eql(u8, name, pair[0])) break i;
+            } else {
+                raise(py.PyExc_ValueError(), "codes: unknown kind '{s}'", .{pair[0]});
+                return null;
+            };
+            codes[at] = pair[1];
+        }
+        if (py.c.PyDict_GetItemString(args, "ignore")) |obj| {
+            for (strings(arena, obj, "ignore", false) orelse return null) |name| {
+                const at = for (kind_names, 0..) |kind_name, i| {
+                    if (std.mem.eql(u8, kind_name, name)) break i;
+                } else {
+                    raise(py.PyExc_ValueError(), "ignore: unknown kind '{s}'", .{name});
+                    return null;
+                };
+                ignore[at] = true;
+            }
+        }
+
+        const severity = textArg(state, args, "severity", "error") orelse return null;
+        if (!std.mem.eql(u8, severity, "error") and !std.mem.eql(u8, severity, "warning") and !std.mem.eql(u8, severity, "note")) {
+            raise(py.PyExc_ValueError(), "severity must be 'error', 'warning' or 'note'", .{});
+            return null;
+        }
+        const basic: []const []const u8 = if (py.c.PyDict_GetItemString(args, "basic")) |b| strings(arena, b, "basic", false) orelse return null else &.{};
+
+        tr.* = .{
+            .namespace = textArg(state, args, "namespace", "") orelse return null,
+            .literals = literals.items,
+            .containers = containers.items,
+            .type_names = compileSelectors(state, py.c.PyDict_GetItemString(args, "type_names"), "type_names") orelse return null,
+            .type_args = compileSelectors(state, py.c.PyDict_GetItemString(args, "type_args"), "type_args") orelse return null,
+            .optionals = compileSelectors(state, py.c.PyDict_GetItemString(args, "optional"), "optional") orelse return null,
+            .variables = compileSelectors(state, py.c.PyDict_GetItemString(args, "variables"), "variables") orelse return null,
+            .functions = compileSelectors(state, py.c.PyDict_GetItemString(args, "functions"), "functions") orelse return null,
+            .structs = compileSelectors(state, py.c.PyDict_GetItemString(args, "structs"), "structs") orelse return null,
+            .binaries = compileSelectors(state, py.c.PyDict_GetItemString(args, "binary"), "binary") orelse return null,
+            .unaries = compileSelectors(state, py.c.PyDict_GetItemString(args, "unary"), "unary") orelse return null,
+            .calls = compileSelectors(state, py.c.PyDict_GetItemString(args, "calls"), "calls") orelse return null,
+            .indexes = compileSelectors(state, py.c.PyDict_GetItemString(args, "index"), "index") orelse return null,
+            .assigns = compileSelectors(state, py.c.PyDict_GetItemString(args, "assigns"), "assigns") orelse return null,
+            .returns = compileSelectors(state, py.c.PyDict_GetItemString(args, "returns"), "returns") orelse return null,
+            .conditions = compileSelectors(state, py.c.PyDict_GetItemString(args, "conditions"), "conditions") orelse return null,
+            .operators = operators.items,
+            .basic = basic,
+            .coerce = coerce,
+            .builtins = builtins,
+            .labels = labels,
+            .names = type_names,
+            .severity = severity,
+            .codes = codes,
+            .ignore = ignore,
+        };
+        return tr;
+    }
+
     fn compileRule(state: *State, kind: Kind, args: *PyObject) ?CompiledRule {
         if (kind == .scopes) {
             const scope = compileScopes(state, args) orelse return null;
             return .{ .kind = kind, .message = "", .code = "", .severity = "error", .scope = scope };
+        }
+        if (kind == .types) {
+            const compiled_types = compileTypes(state, args) orelse return null;
+            return .{ .kind = kind, .message = "", .code = "", .severity = "error", .types = compiled_types };
         }
         const sel_obj = py.c.PyDict_GetItemString(args, "selector") orelse {
             raise(py.PyExc_ValueError(), "rule has no selector", .{});
@@ -1100,7 +1505,7 @@ const Rules = struct {
                 .unique => "duplicate '{text}'",
                 .require => "{rule} is incomplete",
                 .count => "wrong number of items ({count})",
-                .scopes, .custom => "",
+                .scopes, .custom, .types => "",
             }) orelse return null,
             .code = textArg(state, args, "code", @tagName(kind)) orelse return null,
             .severity = textArg(state, args, "severity", "error") orelse return null,
@@ -1158,7 +1563,7 @@ const Rules = struct {
                 py.Py_IncRef(function);
                 compiled.callback = function;
             },
-            .forbid, .scopes => {},
+            .forbid, .scopes, .types => {},
         }
         return compiled;
     }
@@ -1220,6 +1625,31 @@ const Rules = struct {
                     };
                 }
             }
+        }
+
+        // A types() rule types the names of a scopes() rule, and its basic
+        // types are names that rule must know: `int` in `x: int` is a use
+        for (state.rules.items) |r| {
+            const tr = r.types orelse continue;
+            var target: ?*ScopeRule = null;
+            for (state.rules.items) |other| {
+                const sr = other.scope orelse continue;
+                if (tr.namespace.len == 0 or std.mem.eql(u8, sr.namespace, tr.namespace)) {
+                    target = @constCast(sr);
+                    break;
+                }
+            }
+            const sr = target orelse {
+                if (tr.namespace.len == 0) raise(py.PyExc_ValueError(), "types() needs a scopes() rule in the same Rules: it types the names that rule resolves", .{}) else raise(py.PyExc_ValueError(), "types(namespace='{s}'): no scopes() rule has that namespace", .{tr.namespace});
+                return null;
+            };
+            const extended = arena.alloc([]const u8, sr.builtins.len + tr.basic.len) catch {
+                _ = py.c.PyErr_NoMemory();
+                return null;
+            };
+            @memcpy(extended[0..sr.builtins.len], sr.builtins);
+            @memcpy(extended[sr.builtins.len..], tr.basic);
+            sr.builtins = extended;
         }
 
         ok = true;
@@ -1344,8 +1774,10 @@ const Rules = struct {
     const Link = struct {
         runs: []const *Run,
         keys: []const *PyObject,
-        /// Each key's text when it is a str, else ""
-        key_texts: []const []const u8,
+        /// Key text (of the keys that are str) -> file index
+        by_text: std.StringHashMapUnmanaged(u32) = .empty,
+        /// With a resolver: key -> file index, as a dict
+        by_key: ?*PyObject = null,
         /// resolve(module_text, importing_key) -> key or None. Without one,
         /// a module's text (minus quotes) is the key of its file.
         resolver: ?*PyObject,
@@ -1359,19 +1791,17 @@ const Rules = struct {
                 const key = py.c.PyObject_CallFunctionObjArgs(function, text, self.keys[from], @as(?*PyObject, null)) orelse return error.PythonError;
                 defer py.Py_DecRef(key);
                 if (key == py.Py_None()) return null;
-                for (self.keys, 0..) |k, i| {
-                    const same = py.c.PyObject_RichCompareBool(k, key, py.c.Py_EQ);
-                    if (same < 0) return error.PythonError;
-                    if (same == 1) return @intCast(i);
-                }
-                return null;
+                const found = py.c.PyDict_GetItemWithError(self.by_key.?, key) orelse {
+                    // Not a key of the project (one that can't be hashed is none of them)
+                    py.c.PyErr_Clear();
+                    return null;
+                };
+                return @intCast(py.c.PyLong_AsUnsignedLong(found));
             }
             var name = module;
             if (name.len >= 2 and (name[0] == '"' or name[0] == '\'') and name[name.len - 1] == name[0]) name = name[1 .. name.len - 1];
-            for (self.key_texts, 0..) |k, i| {
-                if (k.len != 0 and std.mem.eql(u8, k, name)) return @intCast(i);
-            }
-            return null;
+            if (name.len == 0) return null;
+            return self.by_text.get(name);
         }
     };
 
@@ -1587,6 +2017,40 @@ const Rules = struct {
                 }
             }
             return out.items[0..kept];
+        }
+
+        /// What a types() rule matched in this file, for the checker. `r`
+        /// is the scopes() result whose names it types.
+        fn typeInputs(self: *Run, tr: *const TypeRule, r: usize) !types_mod.Inputs {
+            const literals = try self.arena.alloc(types_mod.Literal, tr.literals.len);
+            for (literals, tr.literals) |*slot, lit| slot.* = .{ .nodes = try self.matchAll(lit.selectors), .type = lit.type };
+            const containers = try self.arena.alloc(types_mod.Container, tr.containers.len);
+            for (containers, tr.containers) |*slot, c| slot.* = .{ .nodes = try self.matchAll(c.selectors), .name = c.type };
+            return .{
+                .labels = tr.labels,
+                .names = tr.names,
+                .literals = literals,
+                .containers = containers,
+                .type_names = try self.matchAll(tr.type_names),
+                .type_args = try self.matchAll(tr.type_args),
+                .optionals = try self.matchAll(tr.optionals),
+                .variables = try self.matchAll(tr.variables),
+                .functions = try self.matchAll(tr.functions),
+                .structs = try self.matchAll(tr.structs),
+                .binaries = try self.matchAll(tr.binaries),
+                .unaries = try self.matchAll(tr.unaries),
+                .calls = try self.matchAll(tr.calls),
+                .indexes = try self.matchAll(tr.indexes),
+                .members = self.scope_inputs.items[r].members,
+                .uses = self.scope_inputs.items[r].uses,
+                .assigns = try self.matchAll(tr.assigns),
+                .returns = try self.matchAll(tr.returns),
+                .conditions = try self.matchAll(tr.conditions),
+                .operators = tr.operators,
+                .basic = tr.basic,
+                .coerce = tr.coerce,
+                .builtins = tr.builtins,
+            };
         }
 
         /// The child of `node` labelled `field`, or NONE (field 0 never matches).
@@ -1879,7 +2343,8 @@ const Rules = struct {
 
         fn check(self: *Run, rule_idx: usize) !void {
             const cr = &self.state.rules.items[rule_idx];
-            if (cr.kind == .custom) return; // run afterwards, from Python
+            // Custom rules run afterwards, from Python; types once the names are resolved
+            if (cr.kind == .custom or cr.kind == .types) return;
             if (cr.scope) |sr| return self.prepareScopes(sr);
             const t = self.tree;
             var chain_buf: [selector.MAX_COMPOUNDS]u32 = undefined;
@@ -1997,7 +2462,7 @@ const Rules = struct {
                         }
                     }
                 },
-                .scopes, .custom => unreachable,
+                .scopes, .custom, .types => unreachable,
             }
         }
     };
@@ -2197,19 +2662,27 @@ const Rules = struct {
         // Pass 2: names, with the imports resolved against the other files
         const runs = allocator.alloc(*Run, files.len) catch return oomObject() != null;
         defer allocator.free(runs);
-        const key_texts = allocator.alloc([]const u8, files.len) catch return oomObject() != null;
-        defer allocator.free(key_texts);
+        var link = Link{ .runs = runs, .keys = keys orelse &.{}, .resolver = resolver };
+        defer link.by_text.deinit(allocator);
+        defer if (link.by_key) |d| py.Py_DecRef(d);
+        if (keys != null and resolver != null) link.by_key = py.c.PyDict_New() orelse return false;
         for (files, 0..) |f, i| {
             runs[i] = f.run;
-            key_texts[i] = "";
-            if (keys) |ks| {
-                if (py.PyUnicode_Check(ks[i])) {
-                    var len: py.Py_ssize_t = 0;
-                    if (py.c.PyUnicode_AsUTF8AndSize(ks[i], &len)) |ptr| key_texts[i] = ptr[0..@intCast(len)] else py.c.PyErr_Clear();
-                }
+            const ks = keys orelse continue;
+            if (link.by_key) |d| {
+                const index = py.c.PyLong_FromUnsignedLong(@intCast(i)) orelse return false;
+                defer py.Py_DecRef(index);
+                if (py.PyDict_SetItem(d, ks[i], index) != 0) return false;
             }
+            if (!py.PyUnicode_Check(ks[i])) continue;
+            var len: py.Py_ssize_t = 0;
+            const ptr = py.c.PyUnicode_AsUTF8AndSize(ks[i], &len) orelse {
+                py.c.PyErr_Clear();
+                continue;
+            };
+            const entry = link.by_text.getOrPut(allocator, ptr[0..@intCast(len)]) catch return oomObject() != null;
+            if (!entry.found_existing) entry.value_ptr.* = @intCast(i);
         }
-        const link = Link{ .runs = runs, .keys = keys orelse &.{}, .key_texts = key_texts, .resolver = resolver };
         for (files, 0..) |f, file_index| {
             for (0..f.run.scope_inputs.items.len) |index| {
                 f.run.finishScopes(index, if (keys != null) &link else null, file_index) catch |e| switch (e) {
@@ -2219,12 +2692,110 @@ const Rules = struct {
             }
         }
 
+        // Types, once every file's names are resolved
+        if (!runTypes(state, files)) return false;
+
         // Pass 3: the parts that call into Python, and the diagnostics
+        var key_share: ?*KeyShare = null;
+        if (keys) |ks| {
+            const share = allocator.create(KeyShare) catch return oomObject() != null;
+            share.* = .{ .refs = 1, .keys = allocator.dupe(*PyObject, ks) catch {
+                allocator.destroy(share);
+                return oomObject() != null;
+            } };
+            for (share.keys) |k| py.Py_IncRef(k);
+            key_share = share;
+        }
+        // Ours until here; the files that took it keep it
+        defer if (key_share) |share| share.release();
         for (files) |f| {
-            if (!finishFile(f, keys)) return false;
+            if (!finishFile(f, key_share)) return false;
         }
         for (files, 0..) |f, i| out[i] = f.analysis_obj;
         done = true;
+        return true;
+    }
+
+    /// Type-check the files with the rules' types() rule, if there is one.
+    /// The files share one table of types, so that a type crossing an import
+    /// is the same on both sides.
+    fn runTypes(state: *State, files: []const File) bool {
+        var found: ?*const TypeRule = null;
+        for (state.rules.items) |r| {
+            if (r.types) |tr| found = found orelse tr;
+        }
+        const tr = found orelse return true;
+        if (files.len == 0) return true;
+
+        const share = allocator.create(TypeShare) catch return oomObject() != null;
+        share.* = .{ .arena = std.heap.ArenaAllocator.init(allocator), .table = undefined };
+        // Until a file holds it, it is ours to free
+        var attached: usize = 0;
+        defer if (attached == 0) {
+            share.arena.deinit();
+            allocator.destroy(share);
+        };
+        share.table = types_mod.Table.init(share.arena.allocator()) catch return oomObject() != null;
+
+        const checkers = share.arena.allocator().alloc(*types_mod.Checker, files.len) catch return oomObject() != null;
+        for (files, 0..) |f, i| {
+            const run = f.run;
+            // The scopes() rule whose names are typed
+            var result_index: ?usize = null;
+            for (run.scope_results.items, 0..) |result, r| {
+                if (tr.namespace.len == 0 or std.mem.eql(u8, result.namespace, tr.namespace)) {
+                    result_index = r;
+                    break;
+                }
+            }
+            const r = result_index orelse {
+                raise(py.PyExc_ValueError(), "types() needs a scopes() rule{s}{s}{s}", .{
+                    if (tr.namespace.len != 0) " with namespace '" else "",
+                    tr.namespace,
+                    if (tr.namespace.len != 0) "'" else "",
+                });
+                return false;
+            };
+            const inputs = run.typeInputs(tr, r) catch return oomObject() != null;
+            const checker = run.arena.create(types_mod.Checker) catch return oomObject() != null;
+            checker.* = .{
+                .arena = run.arena,
+                .table = &share.table,
+                .tree = run.tree,
+                .names = &run.scope_results.items[r].result,
+                .in = inputs,
+                .file = @intCast(i),
+                .others = checkers,
+            };
+            checkers[i] = checker;
+            checker.prepare() catch |e| {
+                if (e == error.OutOfMemory) _ = py.c.PyErr_NoMemory() else raise(py.PyExc_ValueError(), "types(): a type in the rule's options could not be read", .{});
+                return false;
+            };
+            f.data.checker = checker;
+            f.data.typed_result = r;
+        }
+        // Every checker exists before any runs: they ask each other about imported names
+        for (checkers) |checker| checker.check() catch return oomObject() != null;
+        for (checkers) |checker| checker.complete() catch return oomObject() != null;
+
+        for (files, checkers) |f, checker| {
+            for (checker.problems.items) |p| {
+                const k = @intFromEnum(p.kind);
+                if (tr.ignore[k]) continue;
+                const flat = f.run.tree.nodes[p.node];
+                f.run.add(.{
+                    .start = flat.text_start,
+                    .end = flat.text_end,
+                    .severity = f.run.arena.dupe(u8, tr.severity) catch return oomObject() != null,
+                    .code = f.run.arena.dupe(u8, tr.codes[k]) catch return oomObject() != null,
+                    .message = p.message,
+                }) catch return oomObject() != null;
+            }
+            f.data.type_share = share;
+            share.refs += 1;
+            attached += 1;
+        }
         return true;
     }
 
@@ -2301,7 +2872,7 @@ const Rules = struct {
 
     /// Last pass for one file: hand the names to its Analysis, run the rules
     /// written in Python, and turn the findings into Diagnostic objects.
-    fn finishFile(f: File, keys: ?[]const *PyObject) bool {
+    fn finishFile(f: File, keys: ?*KeyShare) bool {
         const run = f.run;
         const arena = run.arena;
 
@@ -2312,10 +2883,10 @@ const Rules = struct {
         }
         f.data.results = run.scope_results.items;
         f.data.objects = objects;
-        if (keys) |ks| {
-            const kept = arena.dupe(*PyObject, ks) catch return oomObject() != null;
-            for (kept) |k| py.Py_IncRef(k);
-            f.data.keys = kept;
+        if (keys) |share| {
+            share.refs += 1;
+            f.data.key_share = share;
+            f.data.keys = share.keys;
         }
 
         if (!runPython(run, f.analysis._tree.?, f.analysis_obj)) return false;
@@ -2386,6 +2957,7 @@ pub const Module = pyoz.module(.{
         pyoz.func("count", count, "count(selector, exactly=None, min=None, max=None, message=None, code=None, severity=None): the number of matches within the node the selector's first part matched must be in range."),
         pyoz.func("scopes", scopes, "scopes(scope, define, use, define_outer=None, hoist=None, after=None, builtins=None, ordered=True, namespace='name', on_undefined='error', on_redefine='error', on_unused='ignore', on_shadow='ignore', on_no_member='error', members=None, member_labels=('target', 'name'), imports=None, import_all=None, import_labels=('module', 'names', 'alias'), exports=None, on_no_module='error', on_no_export='error', on_unresolved=None, messages=None, codes=None): resolve names. `scope` nodes open a scope; `define` nodes define their text as a name in the scope around them (`define_outer`: in the scope outside that one); `use` nodes must resolve to a definition. `hoist` definitions are visible before their position; `after` definitions only once their parent node has ended. `members` nodes are accesses like a.b: the child labelled name is looked up in the scope that the child labelled target names."),
         pyoz.func("custom", custom, "custom(selector, function, code=None): call function(node, ctx) for every node matching `selector`."),
+        pyoz.func("types", types, "types(basic=None, coerce=None, literals=None, containers=None, names=None, type_names=None, type_args=None, optional=None, variables=None, functions=None, structs=None, binary=None, unary=None, calls=None, index=None, assigns=None, returns=None, conditions=None, operators=None, builtins=None, labels=None, namespace=None, severity='error', codes=None, ignore=None): type-check the program. Each option names the nodes that play a role (selectors), read through labelled children; see the documentation. Needs a scopes() rule for the names."),
         pyoz.func("version", version, "Return the zrules version string"),
     },
     .classes = &.{

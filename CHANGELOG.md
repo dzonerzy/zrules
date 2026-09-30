@@ -25,9 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`examples/lua`:** a complete Lua 5.4 grammar and checker, tested on the Lua code shipped with nmap and sysdig.
 - **[Reference](docs/reference.md)** of every option, class member and diagnostic code.
 - **Parallel projects:** `analyze_project()` checks the files on several threads, with the Python lock released: about twice as fast as checking them one after another on large projects.
-
-### Changed
-- **Faster checks:** a program of 265,000 nodes is checked with names, types and flow in 15 ms, from 38 ms. Selector lists are merged rather than re-matched and sorted; `a > b` selectors and `:has(> b)` look at parents and children only; the operator table and the types written in the options are read once; the type checker, name resolution and flow keep their per-node data in arrays and reuse their buffers.
+- **Speed:** a program of 265,000 nodes is checked with names, types and flow in about 15 ms, where zgram parses it in 4.6 ms.
 - **`rules.analyze()`** returns an `Analysis` with the diagnostics and the symbol table: `symbols`, `resolve(node)`, `at(offset)`.
 - **Custom rules:** `@rules.rule(selector)`, `rules.add()` and `custom()` call a Python function with the node and a context (`error`, `warning`, `note`, `resolve`).
 - **`examples/tiny`:** a small language whose static errors are all found by zrules.

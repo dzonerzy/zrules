@@ -541,6 +541,25 @@ class TestDepth:
             threading.stack_size(old)
         assert out == [["expected 'str', got 'int'"]]
 
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "let x = " + "(" * 1_000_000 + "1" + ")" * 1_000_000 + ";",
+            "let x = " + "[" * 1_000_000 + "1" + "]" * 1_000_000 + ";",
+            "fn f() { " + "if true { " * 500_000 + "}" * 500_000 + " }",
+        ],
+        ids=["parentheses", "lists", "blocks"],
+    )
+    def test_input_too_deep_to_parse_is_a_parse_error(self, source):
+        # zgram stops at the native stack's limit: an error, not a crash
+        import zgram
+
+        with pytest.raises(zgram.ParseError, match="nested too deeply"):
+            RULES.check(source)
+        with pytest.raises(zgram.ParseError, match="nested too deeply"):
+            RULES.analyze_project({"deep": source, "fine": "let y = 1;"})
+        assert messages("let y: str = 1;") == ["expected 'str', got 'int'"]
+
     def test_type_text_in_options_nests_only_so_deep(self):
         with pytest.raises(ValueError, match="builtins: 'list"):
             make(builtins={"print": "list[" * 5000 + "int" + "]" * 5000})

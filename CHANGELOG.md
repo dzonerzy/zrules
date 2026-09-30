@@ -5,6 +5,12 @@ All notable changes to zrules are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3] - 2026-10-01
+
+### Added
+- **`Selector(parser, text)`**: a selector on its own, compiled against a parser's grammar; `match(tree)` gives the indices of the matching nodes, in source order. For tools that classify nodes the way rules do (an editor's outline and highlighting).
+- **`Analysis.visible(offset, namespace=None)`**: the symbols a name written at a position could refer to, by the `scopes()` rule's own rules (ordering, hoisting, builtins, imports), innermost first and inner names hiding outer ones. For completion.
+
 ## [0.1.2] - 2026-10-01
 
 ### Added

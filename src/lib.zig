@@ -895,13 +895,155 @@ const Analysis = struct {
         return .{ .value = none() };
     }
 
-    pub const __doc__: [*:0]const u8 = "The result of Rules.analyze(): diagnostics (in source order), tree, symbols (from scopes() rules), ok (no errors), resolve(node) and at(offset).";
+    /// The Symbols visible at a byte offset of the source: what a name
+    /// written there could refer to (innermost scope first, an inner name
+    /// hiding an outer one, builtins and imported names last).
+    pub fn visible(self: *const Analysis, args: pyoz.Args(struct { offset: i64, namespace: ?*PyObject = null })) pyoz.Signature(?*PyObject, "list[Symbol]") {
+        const data = self._data orelse return .{ .value = py.c.PyList_New(0) };
+        const offset: u32 = @intCast(std.math.clamp(args.value.offset, 0, std.math.maxInt(u32)));
+        // The scopes() rule of that namespace (default: the first)
+        var r: usize = 0;
+        if (args.value.namespace) |ns| {
+            if (ns != py.Py_None()) {
+                const wanted = utf8(ns, "namespace") orelse return .{ .value = null };
+                r = for (data.results, 0..) |result, i| {
+                    if (std.mem.eql(u8, result.namespace, wanted)) break i;
+                } else {
+                    raise(py.PyExc_ValueError(), "no scopes() rule has namespace '{s}'", .{wanted});
+                    return .{ .value = null };
+                };
+            }
+        }
+        if (r >= data.results.len) return .{ .value = py.c.PyList_New(0) };
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const tree = Tree{ .nodes = data.nodes, .input = "", .parents = &.{} };
+        const indices = data.results[r].result.visibleAt(arena.allocator(), &tree, offset) catch return .{ .value = oomObject() };
+        const list = py.c.PyList_New(@intCast(indices.len)) orelse return .{ .value = null };
+        for (indices, 0..) |index, i| {
+            const sym = data.symbol(r, index) orelse {
+                py.Py_DecRef(list);
+                return .{ .value = null };
+            };
+            _ = py.c.PyList_SetItem(list, @intCast(i), sym);
+        }
+        return .{ .value = list };
+    }
+
+    pub const __doc__: [*:0]const u8 = "The result of Rules.analyze(): diagnostics (in source order), tree, symbols (from scopes() rules), ok (no errors), resolve(node), at(offset) and visible(offset).";
+    pub const visible__doc__: [*:0]const u8 = "The Symbols visible at a byte offset of the source, what a name written there could refer to: innermost scope first, an inner name hiding an outer one, builtins and imported names last. namespace= picks the scopes() rule (default: the first).";
     pub const resolve__doc__: [*:0]const u8 = "The Symbol that a node defines or uses, or None. `node` is a zgram Node, a node index, or an AST object built by zgram.";
     pub const resolve__params__ = "node";
     pub const at__doc__: [*:0]const u8 = "The Symbol defined or used at a byte offset of the source, or None.";
     pub const at__params__ = "offset";
     pub const type_of__doc__: [*:0]const u8 = "The type of a node as text ('int', 'list[str]', 'Point'), or None when it is unknown or the rules have no types(). `node` is a zgram Node, a node index, or an AST object built by zgram.";
     pub const type_of__params__ = "node";
+};
+
+/// A selector (or a comma-separated list) compiled against a zgram parser's
+/// grammar, for use on its own: `match(tree)` gives the matching nodes.
+/// (`Selector` in Python.)
+const SelectorObject = struct {
+    _arena: ?*std.heap.ArenaAllocator = null,
+    _names: selector.Names = .{ .rules = &.{}, .fields = &.{}, .actions = &.{} },
+    _selectors: []const selector.Selector = &.{},
+
+    pub fn __new__(args: pyoz.Args(struct { parser: *PyObject, selector: *PyObject })) ?SelectorObject {
+        const arena = allocator.create(std.heap.ArenaAllocator) catch {
+            _ = py.c.PyErr_NoMemory();
+            return null;
+        };
+        arena.* = std.heap.ArenaAllocator.init(allocator);
+        var self = SelectorObject{ ._arena = arena };
+        var ok = false;
+        defer if (!ok) self.__del__();
+        const a = arena.allocator();
+        self._names = .{
+            .rules = Rules.nameList(a, args.value.parser, "rules") orelse return null,
+            .fields = Rules.nameList(a, args.value.parser, "fields") orelse return null,
+            .actions = Rules.nameList(a, args.value.parser, "actions") orelse return null,
+        };
+        const text = utf8(args.value.selector, "selector") orelse return null;
+        var bad: []const u8 = "";
+        self._selectors = selector.compileList(a, self._names, text, &bad) catch |e| {
+            switch (e) {
+                error.UnknownName => raise(py.PyExc_ValueError(), "selector '{s}': the grammar has no rule or class '{s}'", .{ text, bad }),
+                error.UnknownField => raise(py.PyExc_ValueError(), "selector '{s}': the grammar has no label '{s}'", .{ text, bad }),
+                error.EmptySelector => raise(py.PyExc_ValueError(), "the selector is empty", .{}),
+                error.BadSelector => raise(py.PyExc_ValueError(), "selector '{s}' is malformed", .{text}),
+                error.OutOfMemory => _ = py.c.PyErr_NoMemory(),
+            }
+            return null;
+        };
+        ok = true;
+        return self;
+    }
+
+    pub fn __del__(self: *SelectorObject) void {
+        if (self._arena) |arena| {
+            arena.deinit();
+            allocator.destroy(arena);
+        }
+        self._arena = null;
+    }
+
+    /// The indices of the nodes that match, in source order.
+    pub fn match(self: *const SelectorObject, source: *PyObject) pyoz.Signature(?*PyObject, "list[int]") {
+        const tree_obj = (if (py.c.PyObject_HasAttrString(source, "capsule") != 0) blk: {
+            py.Py_IncRef(source);
+            break :blk source;
+        } else py.c.PyObject_GetAttrString(source, "tree")) orelse {
+            py.c.PyErr_Clear();
+            raise(py.PyExc_TypeError(), "expected a zgram Tree or Node", .{});
+            return .{ .value = null };
+        };
+        defer py.Py_DecRef(tree_obj);
+        const capsule = py.c.PyObject_GetAttrString(tree_obj, "capsule") orelse return .{ .value = null };
+        defer py.Py_DecRef(capsule);
+        const view: *const tree_mod.TreeView = @ptrCast(@alignCast(py.c.PyCapsule_GetPointer(capsule, tree_mod.CAPSULE_NAME) orelse return .{ .value = null }));
+        if (view.abi != tree_mod.TREE_ABI) {
+            raise(py.PyExc_RuntimeError(), "this zrules reads zgram trees with TREE_ABI {d}, but the tree has {d}: upgrade zrules or zgram", .{ tree_mod.TREE_ABI, view.abi });
+            return .{ .value = null };
+        }
+        var same = view.rule_count == self._names.rules.len and view.field_count == self._names.fields.len;
+        if (same) {
+            for (self._names.rules, 0..) |name, i| same = same and std.mem.eql(u8, name, view.rule_names.?[i].slice());
+        }
+        if (!same) {
+            raise(py.PyExc_ValueError(), "the tree was parsed with a different grammar than the selector was compiled against", .{});
+            return .{ .value = null };
+        }
+
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const nodes: []const tree_mod.FlatNode = if (view.nodes) |n| n[0..view.node_count] else &.{};
+        const tree = Tree{
+            .nodes = nodes,
+            .input = if (view.input) |p| p[0..view.input_len] else "",
+            .parents = Tree.computeParents(arena.allocator(), nodes) catch return .{ .value = oomObject() },
+        };
+        var found: std.ArrayList(u32) = .empty;
+        for (0..nodes.len) |i| {
+            for (self._selectors) |*sel| {
+                if (!sel.matches(&tree, @intCast(i), null)) continue;
+                found.append(arena.allocator(), @intCast(i)) catch return .{ .value = oomObject() };
+                break;
+            }
+        }
+        const list = py.c.PyList_New(@intCast(found.items.len)) orelse return .{ .value = null };
+        for (found.items, 0..) |node, i| {
+            const item = py.c.PyLong_FromUnsignedLong(node) orelse {
+                py.Py_DecRef(list);
+                return .{ .value = null };
+            };
+            _ = py.c.PyList_SetItem(list, @intCast(i), item);
+        }
+        return .{ .value = list };
+    }
+
+    pub const __doc__: [*:0]const u8 = "Selector(parser, selector): a selector (or a comma-separated list) compiled against a zgram parser's grammar. match(tree) returns the indices of the nodes that match, in source order.";
+    pub const match__doc__: [*:0]const u8 = "The indices of the nodes of a zgram Tree (or of a Node's tree) that match, in source order.";
+    pub const match__params__ = "tree";
 };
 
 /// What a custom rule's function receives as its second argument. Only
@@ -3612,6 +3754,7 @@ pub const Module = pyoz.module(.{
         pyoz.class("Symbol", Symbol),
         pyoz.class("Context", Context),
         pyoz.class("Project", Project),
+        pyoz.class("Selector", SelectorObject),
     },
 });
 

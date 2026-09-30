@@ -103,6 +103,58 @@ pub const Result = struct {
     /// Name -> id, and (scope, name id) -> symbol: what `lookup` reads
     names: std.StringHashMapUnmanaged(u32) = .empty,
     table: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+    /// Per node: the nearest scope strictly above it (NONE = global); the
+    /// scope nodes (sorted); whether definitions are ordered. What
+    /// `visibleAt` reads.
+    above: []const u32 = &.{},
+    scopes: []const u32 = &.{},
+    ordered: bool = true,
+
+    /// The symbols visible at byte offset `at` of the tree: those of the
+    /// innermost scope around it and of every scope outside that one, an
+    /// inner name hiding an outer one, in that order (innermost scope
+    /// first), builtins and imported names last. In the innermost scope,
+    /// with ordered definitions, only those visible from `at` on (or hoisted).
+    pub fn visibleAt(self: *const Result, arena: Allocator, t: *const Tree, at: u32) ![]const u32 {
+        // The innermost node around the offset, and the scope it is in
+        var node: u32 = NONE;
+        if (t.nodes.len != 0 and t.nodes[0].text_start <= at and at <= t.nodes[0].text_end) {
+            node = 0;
+            descend: while (true) {
+                const stop = t.end(node);
+                var child = node + 1;
+                while (child < stop) : (child = t.end(child)) {
+                    if (t.nodes[child].text_start <= at and at < t.nodes[child].text_end) {
+                        node = child;
+                        continue :descend;
+                    }
+                }
+                break;
+            }
+        }
+        const own_scope: u32 = if (node == NONE) NONE else if (std.sort.binarySearch(u32, self.scopes, node, orderU32) != null) node else self.above[node];
+
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        var out: std.ArrayList(u32) = .empty;
+        var scope = own_scope;
+        while (true) {
+            for (self.symbols.items, 0..) |sym, i| {
+                if (sym.scope != scope) continue;
+                const visible = !self.ordered or sym.hoisted or sym.node == NONE or scope != own_scope or sym.visible_from <= at;
+                if (!visible) continue;
+                const entry = try seen.getOrPut(arena, sym.name);
+                if (entry.found_existing) continue;
+                try out.append(arena, @intCast(i));
+            }
+            if (scope == NONE) break;
+            scope = self.above[scope];
+        }
+        return out.items;
+    }
+
+    fn orderU32(a: u32, b: u32) std.math.Order {
+        return std.math.order(a, b);
+    }
 
     pub fn symbolOf(self: *const Result, node: u64) ?u32 {
         if (node >= self.by_node.len or self.by_node[node] == NONE) return null;
@@ -310,5 +362,15 @@ pub fn analyze(
         }
     }
 
-    return .{ .symbols = symbols, .problems = problems, .by_node = by_node, .open_members = open_members.items, .names = names, .table = table };
+    return .{
+        .symbols = symbols,
+        .problems = problems,
+        .by_node = by_node,
+        .open_members = open_members.items,
+        .names = names,
+        .table = table,
+        .above = above,
+        .scopes = scopes,
+        .ordered = options.ordered,
+    };
 }

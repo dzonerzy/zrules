@@ -470,6 +470,8 @@ The [reference](https://github.com/dzonerzy/zrules/blob/main/docs/reference.md) 
 | `rules.check(source, recover=False)` | the diagnostics of a file, in source order |
 | `rules.analyze(source, recover=False)` | the same, with the symbol table and types |
 | `rules.analyze_project(files, resolve=None, recover=False)` | several files together, in parallel |
+| `analysis.visible(offset)` | the names visible at a position (for completion) |
+| `Selector(parser, text).match(tree)` | a selector on its own: the matching nodes |
 
 ## Architecture
 
@@ -539,6 +541,7 @@ test/
   test_types.py         # types(): inference, checks, options, depth, scale
   test_flow.py          # flow(): unreachable code, returns, unassigned variables
   test_recover.py       # Trees with syntax errors (zgram's recover=True)
+  test_editor_api.py    # Selector on its own, Analysis.visible()
   test_custom.py        # Rules written in Python
   test_parallel.py      # Parallel projects give the results of one thread
   test_example_*.py     # The tiny, typed and Lua examples

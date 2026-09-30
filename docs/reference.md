@@ -35,6 +35,13 @@ Wherever an option takes a selector, it takes a selector text, a comma-separated
 
 A selector has at most 16 parts. Names and labels that the grammar doesn't have are a `ValueError` when the rules are compiled. `@silent` rules produce no nodes and can't be selected.
 
+A selector can be used on its own, outside rules:
+
+```python
+sel = zrules.Selector(parser, "FuncDef > .name, Let > .name")
+sel.match(tree)        # [node index, ...] in source order; a Node stands for its tree
+```
+
 ## Rules()
 
 ```python
@@ -196,6 +203,7 @@ rules.add(selector, function, code=None)
 | `symbols` | every `Symbol`, builtins included |
 | `resolve(node)` | the `Symbol` a node defines or uses, or `None` |
 | `at(offset)` | the `Symbol` defined or used at a byte offset, or `None` |
+| `visible(offset, namespace=None)` | the `Symbol`s a name written at a byte offset could refer to, by the `scopes()` rule's own rules (`ordered`, `hoist`, builtins, imports): innermost scope first, an inner name hiding an outer one, builtins and imported names last. `namespace` picks the `scopes()` rule (default: the first); none without one |
 | `type_of(node)` | the type of a node as text, or `None` when unknown or without a `types()` rule |
 
 `node` is a zgram `Node`, a node index, or an AST object built by zgram. An `Analysis` stays valid after its `Rules` and `Project` are gone.

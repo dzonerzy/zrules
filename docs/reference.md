@@ -45,14 +45,20 @@ Rules(parser, rules=None)
 
 | Member | |
 |---|---|
-| `check(source)` | the diagnostics, as a list of `zgram.Diagnostic` in source order |
-| `analyze(source)` | the same check, returning an `Analysis` |
-| `analyze_project(files, resolve=None)` | check several files together; `files` is a dict of key -> source; returns a `Project` |
+| `check(source, recover=False)` | the diagnostics, as a list of `zgram.Diagnostic` in source order |
+| `analyze(source, recover=False)` | the same check, returning an `Analysis` |
+| `analyze_project(files, resolve=None, recover=False)` | check several files together; `files` is a dict of key -> source; returns a `Project` |
 | `add(selector, function, code=None)` | add a custom rule |
 | `rule(selector, code=None)` | the same as a decorator |
 | `len(rules)` | the number of rules |
 
-`source` is a zgram `Tree`, a zgram `Node` (its whole tree is checked), or `str` / `bytes` (parsed first; raises `zgram.ParseError`). A tree from another grammar is a `ValueError`.
+`source` is a zgram `Tree`, a zgram `Node` (its whole tree is checked), or `str` / `bytes` (parsed first; raises `zgram.ParseError`, or with `recover=True` is parsed with zgram's error recovery). A tree from another grammar is a `ValueError`.
+
+A tree parsed with recovery (`parser.parse_tree(text, recover=True)`, zgram 0.3+) is checked like any other, with three differences:
+
+- Its syntax errors (`tree.errors`, code `syntax`) are in the diagnostics, in source order among the findings.
+- Nothing is reported about the broken text: a finding whose span overlaps an error node or contains a syntax error is left out (whatever rule made it, custom ones included).
+- Nothing is reported *because of* it: `flow()` skips a function (or the top level) whose own body has broken text, since its paths can't be followed (a `return` that didn't parse would be a missing return); an undefined, unused or missing-member name that occurs in the broken text isn't reported (it was probably defined or used there); and `no-export` isn't reported for a name that occurs in the broken text of the file imported from.
 
 `resolve(module_text, importing_key)` returns the key of the file a module name stands for, or `None`. Without it, the module's text (quotes removed) is the key.
 

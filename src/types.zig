@@ -973,12 +973,18 @@ pub const Checker = struct {
         switch (self.role[node]) {
             .literal => return self.aux[node],
             .container => {
-                // name[T]: T is what the first item is; the others must fit it
+                // name[T]: T is what the first item is; the others must fit it.
+                // An item of unknown type makes T unknown (it could be
+                // anything: guessing from the others would report mistakes
+                // that aren't there), the known ones are still compared.
                 var item_type: TypeId = UNKNOWN;
+                var any_unknown = false;
                 var items = self.labelled(node, labels.items);
                 while (items.next()) |item| {
                     const it = try self.typeOf(item);
-                    if (item_type == UNKNOWN) {
+                    if (it == UNKNOWN) {
+                        any_unknown = true;
+                    } else if (item_type == UNKNOWN) {
                         item_type = it;
                     } else if (self.assignable(item_type, it)) {
                         item_type = it; // the wider of the two (int, then float)
@@ -986,7 +992,7 @@ pub const Checker = struct {
                         try self.report(.mismatch, item, "expected an item of type '{s}', got '{s}'", .{ try self.show(item_type), try self.show(it) });
                     }
                 }
-                return self.table.generic(self.in.containers[self.aux[node]].name, &.{item_type});
+                return self.table.generic(self.in.containers[self.aux[node]].name, &.{if (any_unknown) UNKNOWN else item_type});
             },
             .binary => {
                 const left = self.child(node, labels.left);

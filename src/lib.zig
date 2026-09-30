@@ -444,6 +444,64 @@ const Finding = struct {
     }
 };
 
+/// The broken text of a tree parsed with zgram's recover=True: what the
+/// rules say about it would only repeat the syntax errors, or be caused by
+/// them (a name defined in text that didn't parse is "undefined" further on).
+const Broken = struct {
+    /// Error nodes (leaves, so in source order and not overlapping)
+    nodes: []const u32,
+    /// Where the syntax errors are, sorted (an inserted `;` or `}` leaves
+    /// no error node)
+    offsets: []const u32,
+    /// The words (identifiers) of the broken text
+    words: std.StringHashMapUnmanaged(void) = .empty,
+
+    fn init(arena: std.mem.Allocator, tree: *const Tree, error_rule: usize, offsets: []const u32) !*Broken {
+        var nodes: std.ArrayList(u32) = .empty;
+        for (tree.nodes, 0..) |n, i| {
+            if (n.ruleId() >= error_rule) try nodes.append(arena, @intCast(i));
+        }
+        const self = try arena.create(Broken);
+        self.* = .{ .nodes = nodes.items, .offsets = offsets };
+        for (nodes.items) |node| {
+            const text = tree.text(node);
+            var i: usize = 0;
+            while (i < text.len) {
+                if (!isWord(text[i])) {
+                    i += 1;
+                    continue;
+                }
+                const start = i;
+                while (i < text.len and isWord(text[i])) i += 1;
+                try self.words.put(arena, text[start..i], {});
+            }
+        }
+        return self;
+    }
+
+    fn isWord(ch: u8) bool {
+        return std.ascii.isAlphanumeric(ch) or ch == '_' or ch >= 0x80;
+    }
+
+    /// Does [start, end) overlap an error node, or contain a syntax error?
+    fn touches(self: *const Broken, tree: *const Tree, start: u32, end: u32) bool {
+        // The first error node ending after `start`
+        var lo: usize = 0;
+        var hi: usize = self.nodes.len;
+        while (lo < hi) {
+            const mid = (lo + hi) / 2;
+            if (tree.nodes[self.nodes[mid]].text_end <= start) lo = mid + 1 else hi = mid;
+        }
+        if (lo < self.nodes.len and tree.nodes[self.nodes[lo]].text_start < @max(end, start + 1)) return true;
+        const i = std.sort.lowerBound(u32, self.offsets, start, orderU32);
+        return i < self.offsets.len and (self.offsets[i] < end or self.offsets[i] == start);
+    }
+
+    fn orderU32(a: u32, b: u32) std.math.Order {
+        return std.math.order(a, b);
+    }
+};
+
 // ============================================================================
 // Symbol, Analysis, Context: the results of a check
 // ============================================================================
@@ -890,7 +948,7 @@ const Context = struct {
             raise(py.PyExc_ValueError(), "span must be 0 <= start <= end", .{});
             return null;
         }
-        run.add(.{
+        _ = run.add(.{
             .start = @intCast(start),
             .end = @intCast(end),
             .severity = severity,
@@ -1990,6 +2048,9 @@ const Rules = struct {
         scope_inputs: std.ArrayList(ScopeInput) = .empty,
         /// Several files are being checked together: exports are needed
         in_project: bool = false,
+        /// The broken text of a recovered tree; null for a tree without
+        /// syntax errors
+        broken: ?*const Broken = null,
 
         /// Nodes grouped by grammar rule: rule r's nodes, in source order,
         /// are by_rule[rule_start[r]..rule_start[r + 1]]. A rule only looks
@@ -2112,10 +2173,16 @@ const Rules = struct {
             return merged;
         }
 
-        fn add(self: *Run, finding: Finding) !void {
+        /// Add a finding; null if it is about broken text (whose syntax
+        /// error says it), which is left out.
+        fn add(self: *Run, finding: Finding) !?*Finding {
+            if (self.broken) |b| {
+                if (b.touches(self.tree, finding.start, finding.end)) return null;
+            }
             var f = finding;
             f.order = @intCast(self.findings.items.len);
             try self.findings.append(self.arena, f);
+            return &self.findings.items[self.findings.items.len - 1];
         }
 
         fn ruleName(self: *const Run, node: u32) []const u8 {
@@ -2135,21 +2202,20 @@ const Rules = struct {
             };
         }
 
-        fn report(self: *Run, rule_idx: usize, node: u32, n: u32) !*Finding {
+        fn report(self: *Run, rule_idx: usize, node: u32, n: u32) !?*Finding {
             const r = self.state.rules.items[rule_idx];
             const flat = self.tree.nodes[node];
             var v = self.values(node);
             v.count = n;
             v.min = r.min;
             v.max = r.max;
-            try self.add(.{
+            return self.add(.{
                 .start = flat.text_start,
                 .end = flat.text_end,
                 .severity = r.severity,
                 .code = r.code,
                 .message = try format(self.arena, r.message, v),
             });
-            return &self.findings.items[self.findings.items.len - 1];
         }
 
         /// The nearest ancestor of `node` matching one of `selectors`, or NONE.
@@ -2330,17 +2396,60 @@ const Rules = struct {
             }
             var analysis = flow_mod.Analysis{ .arena = self.arena, .tree = self.tree, .in = inputs };
             try analysis.run();
+            // A function (or the top level) with broken text of its own has
+            // paths nobody can follow: what didn't parse may have returned,
+            // assigned or ended a block
+            var is_function: []bool = &.{};
+            var broken_units: std.ArrayList(u32) = .empty;
+            if (self.broken) |b| {
+                is_function = try self.arena.alloc(bool, self.tree.nodes.len);
+                @memset(is_function, false);
+                for (inputs.functions) |node| is_function[node] = true;
+                for (b.nodes) |node| try broken_units.append(self.arena, self.unitOf(is_function, node));
+                for (b.offsets) |offset| try broken_units.append(self.arena, self.unitOf(is_function, self.nodeAt(offset)));
+            }
             for (analysis.problems.items) |p| {
                 const k = @intFromEnum(p.kind);
                 if (fr.levels[k] == .ignore) continue;
+                if (broken_units.items.len != 0 and std.mem.indexOfScalar(u32, broken_units.items, self.unitOf(is_function, p.node)) != null) continue;
                 const flat = self.tree.nodes[p.node];
-                try self.add(.{
+                _ = try self.add(.{
                     .start = flat.text_start,
                     .end = flat.text_end,
                     .severity = if (fr.levels[k] == .err) "error" else "warning",
                     .code = fr.codes[k],
                     .message = try format(self.arena, fr.messages[k], self.values(p.node)),
                 });
+            }
+        }
+
+        /// The function `node` is in (itself, if it is one), or the root.
+        fn unitOf(self: *const Run, is_function: []const bool, node: u32) u32 {
+            var n = node;
+            while (n != NONE and n != 0) : (n = self.tree.parents[n]) {
+                if (is_function[n]) return n;
+            }
+            return 0;
+        }
+
+        /// The innermost node whose text contains `offset`, or ends there
+        /// (a missing `}` belongs to the block that ends where it's
+        /// missing); the root if none.
+        fn nodeAt(self: *const Run, offset: u32) u32 {
+            const t = self.tree;
+            if (t.nodes.len == 0) return 0;
+            var node: u32 = 0;
+            descend: while (true) {
+                const stop = t.end(node);
+                var child = node + 1;
+                while (child < stop) : (child = t.end(child)) {
+                    const c = t.nodes[child];
+                    if (c.text_start <= offset and offset <= c.text_end) {
+                        node = child;
+                        continue :descend;
+                    }
+                }
+                return node;
             }
         }
 
@@ -2559,6 +2668,9 @@ const Rules = struct {
                     for (import.names) |name| {
                         if (offered.get(name.imported)) |node| {
                             try origins.put(self.arena, name.local, .{ .file = other, .node = node });
+                        } else if (link.?.runs[other].broken) |b| {
+                            // (defined in the other file's broken text, probably)
+                            if (!b.words.contains(name.imported)) try import_problems.append(self.arena, .{ .kind = .no_export, .node = name.node, .owner = module_text });
                         } else {
                             try import_problems.append(self.arena, .{ .kind = .no_export, .node = name.node, .owner = module_text });
                         }
@@ -2632,10 +2744,21 @@ const Rules = struct {
 
             for (import_problems.items) |p| try self.reportProblem(sr, p);
             for (result.problems.items) |p| {
+                if (self.aboutBrokenName(p)) continue;
                 if (p.kind == .undefined and sr.on_unresolved != null) {
                     try self.unresolved.append(self.arena, .{ .rule = sr, .problem = p });
                 } else try self.reportProblem(sr, p);
             }
+        }
+
+        /// A name that is undefined, unused or not a member, and occurs in
+        /// the broken text: it was probably defined or used there.
+        fn aboutBrokenName(self: *const Run, p: scopes_mod.Problem) bool {
+            const b = self.broken orelse return false;
+            return switch (p.kind) {
+                .undefined, .unused, .no_member => b.words.contains(self.tree.text(p.node)),
+                else => false,
+            };
         }
 
         fn reportProblem(self: *Run, sr: *const ScopeRule, p: scopes_mod.Problem) !void {
@@ -2662,7 +2785,7 @@ const Rules = struct {
                 finding.note_end = t.nodes[p.other].text_end;
                 finding.has_note = true;
             }
-            try self.add(finding);
+            _ = try self.add(finding);
         }
 
         fn orderU32(a: u32, b: u32) std.math.Order {
@@ -2732,7 +2855,7 @@ const Rules = struct {
                             continue;
                         }
                         const first = t.nodes[entry.value_ptr.*];
-                        const finding = try self.report(rule_idx, m.node, 0);
+                        const finding = try self.report(rule_idx, m.node, 0) orelse continue;
                         finding.note = "first one is here";
                         finding.note_start = first.text_start;
                         finding.note_end = first.text_end;
@@ -2889,24 +3012,25 @@ const Rules = struct {
     }
 
     /// Check a tree and return everything found: diagnostics and symbols.
-    pub fn analyze(self: *Rules, source: *PyObject) pyoz.Signature(?*PyObject, "Analysis") {
+    pub fn analyze(self: *Rules, args: pyoz.Args(struct { source: *PyObject, recover: bool = false })) pyoz.Signature(?*PyObject, "Analysis") {
         var out: [1]*PyObject = undefined;
-        if (!self.analyzeFiles(&.{source}, null, null, &out)) return .{ .value = null };
+        if (!self.analyzeFiles(&.{args.value.source}, null, null, args.value.recover, &out)) return .{ .value = null };
         return .{ .value = out[0] };
     }
 
-    /// Check a tree (a zgram Tree or Node, or source text to parse first)
-    /// against the rules. Returns the diagnostics in source order.
-    pub fn check(self: *Rules, source: *PyObject) pyoz.Signature(?*PyObject, "list[Diagnostic]") {
+    /// Check a tree (a zgram Tree or Node, or source text to parse first,
+    /// with syntax error recovery if `recover`) against the rules. Returns
+    /// the diagnostics in source order.
+    pub fn check(self: *Rules, args: pyoz.Args(struct { source: *PyObject, recover: bool = false })) pyoz.Signature(?*PyObject, "list[Diagnostic]") {
         var out: [1]*PyObject = undefined;
-        if (!self.analyzeFiles(&.{source}, null, null, &out)) return .{ .value = null };
+        if (!self.analyzeFiles(&.{args.value.source}, null, null, args.value.recover, &out)) return .{ .value = null };
         defer py.Py_DecRef(out[0]);
         return .{ .value = py.c.PyObject_GetAttrString(out[0], "diagnostics") };
     }
 
     /// Check several files together: imports between them are resolved.
     /// `files` maps a key (usually a module name or a path) to a source.
-    pub fn analyze_project(self: *Rules, args: pyoz.Args(struct { files: *PyObject, resolve: ?*PyObject = null })) pyoz.Signature(?*PyObject, "Project") {
+    pub fn analyze_project(self: *Rules, args: pyoz.Args(struct { files: *PyObject, resolve: ?*PyObject = null, recover: bool = false })) pyoz.Signature(?*PyObject, "Project") {
         const files = args.value.files;
         if (!py.PyDict_Check(files)) {
             raise(py.PyExc_TypeError(), "files must be a dict of key -> source (a zgram Tree or Node, or text)", .{});
@@ -2934,7 +3058,7 @@ const Rules = struct {
             keys[i] = key.?;
             sources[i] = value.?;
         }
-        if (!self.analyzeFiles(sources[0..i], keys[0..i], resolver, out)) return .{ .value = null };
+        if (!self.analyzeFiles(sources[0..i], keys[0..i], resolver, args.value.recover, out)) return .{ .value = null };
         defer for (out[0..i]) |obj| py.Py_DecRef(obj);
 
         const analyses = py.c.PyDict_New() orelse return .{ .value = null };
@@ -3067,7 +3191,7 @@ const Rules = struct {
     /// Check `sources` together. `keys` names them (null: one file checked
     /// alone, whose imports can't be followed). On success `out` receives a
     /// new reference to each file's Analysis.
-    fn analyzeFiles(self: *Rules, sources: []const *PyObject, keys: ?[]const *PyObject, resolver: ?*PyObject, out: []*PyObject) bool {
+    fn analyzeFiles(self: *Rules, sources: []const *PyObject, keys: ?[]const *PyObject, resolver: ?*PyObject, recover: bool, out: []*PyObject) bool {
         const state = self._state orelse {
             raise(py.PyExc_RuntimeError(), "Rules is not initialized", .{});
             return false;
@@ -3080,7 +3204,7 @@ const Rules = struct {
             for (files[0..opened]) |f| py.Py_DecRef(f.analysis_obj);
         };
         for (sources) |source| {
-            files[opened] = self.openFile(state, source) orelse return false;
+            files[opened] = self.openFile(state, source, recover) orelse return false;
             files[opened].run.in_project = keys != null;
             opened += 1;
         }
@@ -3243,7 +3367,7 @@ const Rules = struct {
                 const k = @intFromEnum(p.kind);
                 if (tr.ignore[k]) continue;
                 const flat = f.run.tree.nodes[p.node];
-                f.run.add(.{
+                _ = f.run.add(.{
                     .start = flat.text_start,
                     .end = flat.text_end,
                     .severity = f.run.arena.dupe(u8, tr.severity) catch return oomObject() != null,
@@ -3259,11 +3383,12 @@ const Rules = struct {
     }
 
     /// Read a source's tree through its capsule and set up its run.
-    fn openFile(self: *Rules, state: *State, source: *PyObject) ?File {
-        // Text is parsed first; a Node stands for its Tree
+    fn openFile(self: *Rules, state: *State, source: *PyObject, recover: bool) ?File {
+        // Text is parsed first (recovering from syntax errors if asked); a
+        // Node stands for its Tree
         var tree_obj: *PyObject = undefined;
         if (py.PyUnicode_Check(source) or py.PyBytes_Check(source)) {
-            tree_obj = py.c.PyObject_CallMethod(self._parser.?, "parse_tree", "O", source) orelse return null;
+            tree_obj = (if (recover) parseRecovering(self._parser.?, source) else py.c.PyObject_CallMethod(self._parser.?, "parse_tree", "O", source)) orelse return null;
         } else if (py.c.PyObject_HasAttrString(source, "capsule") != 0) {
             tree_obj = source;
             py.Py_IncRef(tree_obj);
@@ -3319,9 +3444,50 @@ const Rules = struct {
         data.nodes = nodes;
         const run = arena.create(Run) catch return oomFile();
         run.* = .{ .arena = arena, .state = state, .tree = tree };
+        const offsets = syntaxErrorOffsets(arena, tree_obj) orelse return null;
+        if (offsets.len != 0) run.broken = Broken.init(arena, tree, state.names.rules.len, offsets) catch return oomFile();
 
         done = true;
         return .{ .analysis_obj = analysis_obj, .analysis = analysis, .data = data, .run = run, .input = input };
+    }
+
+    /// parser.parse_tree(source, recover=True)
+    fn parseRecovering(parser: *PyObject, source: *PyObject) ?*PyObject {
+        const method = py.c.PyObject_GetAttrString(parser, "parse_tree") orelse return null;
+        defer py.Py_DecRef(method);
+        const args = py.c.PyTuple_Pack(1, source) orelse return null;
+        defer py.Py_DecRef(args);
+        const kwargs = py.c.Py_BuildValue("{s:O}", "recover", py.Py_True()) orelse return null;
+        defer py.Py_DecRef(kwargs);
+        return py.c.PyObject_Call(method, args, kwargs);
+    }
+
+    /// Where the syntax errors of a tree parsed with recover=True are
+    /// (tree.errors, zgram 0.3+), sorted; empty for any other tree. Null
+    /// with an exception set on failure.
+    fn syntaxErrorOffsets(arena: std.mem.Allocator, tree_obj: *PyObject) ?[]const u32 {
+        const errors = py.c.PyObject_GetAttrString(tree_obj, "errors") orelse {
+            py.c.PyErr_Clear();
+            return &.{};
+        };
+        defer py.Py_DecRef(errors);
+        if (!py.PyList_Check(errors)) return &.{};
+        const n: usize = @intCast(py.c.PyList_Size(errors));
+        const offsets = arena.alloc(u32, n) catch {
+            _ = py.c.PyErr_NoMemory();
+            return null;
+        };
+        for (offsets, 0..) |*slot, i| {
+            const span = py.c.PyObject_GetAttrString(py.c.PyList_GetItem(errors, @intCast(i)), "span") orelse return null;
+            defer py.Py_DecRef(span);
+            const start = py.c.PySequence_GetItem(span, 0) orelse return null;
+            defer py.Py_DecRef(start);
+            const value = py.c.PyLong_AsUnsignedLong(start);
+            if (py.c.PyErr_Occurred() != null) return null;
+            slot.* = @intCast(@min(value, std.math.maxInt(u32)));
+        }
+        std.sort.pdq(u32, offsets, {}, std.sort.asc(u32));
+        return offsets;
     }
 
     fn oomFile() ?File {
@@ -3358,8 +3524,22 @@ const Rules = struct {
         defer py.Py_DecRef(cls);
 
         const lines: []const u32 = if (run.findings.items.len == 0) &.{} else lineStarts(arena, f.input) catch return oomObject() != null;
-        const list = py.c.PyList_New(@intCast(run.findings.items.len)) orelse return false;
-        for (run.findings.items, 0..) |finding, i| {
+        // A recovered tree's syntax errors come first at a position, among
+        // the findings in source order: one list for everything wrong
+        const syntax: ?*PyObject = if (run.broken != null) py.c.PyObject_GetAttrString(f.analysis._tree.?, "errors") orelse return false else null;
+        defer if (syntax) |s| py.Py_DecRef(s);
+        // (the list read in openFile: its offsets are broken.offsets)
+        const syntax_count: usize = if (syntax) |s| @min(@as(usize, @intCast(py.c.PyList_Size(s))), run.broken.?.offsets.len) else 0;
+        const list = py.c.PyList_New(@intCast(run.findings.items.len + syntax_count)) orelse return false;
+        var next_syntax: usize = 0;
+        var out: usize = 0;
+        for (run.findings.items) |finding| {
+            while (next_syntax < syntax_count and run.broken.?.offsets[next_syntax] <= finding.start) : (next_syntax += 1) {
+                const d = py.c.PyList_GetItem(syntax.?, @intCast(next_syntax));
+                py.Py_IncRef(d);
+                _ = py.c.PyList_SetItem(list, @intCast(out), d);
+                out += 1;
+            }
             var notes: ?*PyObject = null;
             defer if (notes) |n| py.Py_DecRef(n);
             if (finding.has_note) {
@@ -3378,18 +3558,23 @@ const Rules = struct {
                 py.Py_DecRef(list);
                 return false;
             };
-            _ = py.c.PyList_SetItem(list, @intCast(i), d);
+            _ = py.c.PyList_SetItem(list, @intCast(out), d);
+            out += 1;
+        }
+        while (next_syntax < syntax_count) : (next_syntax += 1) {
+            const d = py.c.PyList_GetItem(syntax.?, @intCast(next_syntax));
+            py.Py_IncRef(d);
+            _ = py.c.PyList_SetItem(list, @intCast(out), d);
+            out += 1;
         }
         f.analysis._diagnostics = list;
         return true;
     }
 
     pub const __doc__: [*:0]const u8 = "Rules(parser, rules=None): rules compiled against a zgram parser's grammar. check(source) returns the zgram.Diagnostic of every violation, in source order; analyze(source) also returns the symbols found by scopes() rules.";
-    pub const check__doc__: [*:0]const u8 = "Check a zgram Tree or Node (or source text, parsed first) against the rules. Returns a list of zgram.Diagnostic in source order.";
-    pub const check__params__ = "source";
+    pub const check__doc__: [*:0]const u8 = "Check a zgram Tree or Node (or source text, parsed first; with recover=True a syntax error doesn't raise) against the rules. Returns a list of zgram.Diagnostic in source order. For a tree parsed with recover=True, its syntax errors are in the list, and nothing is reported about the broken text.";
     pub const analyze__doc__: [*:0]const u8 = "Like check(), but returns an Analysis: diagnostics, tree, symbols, and resolve(node) / at(offset) to look names up.";
-    pub const analyze__params__ = "source";
-    pub const analyze_project__doc__: [*:0]const u8 = "Check several files together, resolving the imports between them. files is a dict of key -> source; resolve(module_text, importing_key) returns the key of the file a module name refers to, or None (default: the module's text, without quotes, is the key). Returns a Project.";
+    pub const analyze_project__doc__: [*:0]const u8 = "Check several files together, resolving the imports between them. files is a dict of key -> source; resolve(module_text, importing_key) returns the key of the file a module name refers to, or None (default: the module's text, without quotes, is the key); recover=True parses text sources with syntax error recovery. Returns a Project.";
     pub const add__doc__: [*:0]const u8 = "Add a custom rule: function(node, ctx) is called for every node matching the selector. Returns the function.";
     pub const rule__doc__: [*:0]const u8 = "Decorator form of add(): @rules.rule('Call') above a function(node, ctx).";
 };

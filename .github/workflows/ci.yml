@@ -80,7 +80,7 @@ jobs:
                   path: dist
 
             - name: Install zgram
-              run: python -m pip install "zgram-py>=0.2.1"
+              run: python -m pip install "zgram-py>=0.3.1"
 
             - name: Install wheel
               shell: bash

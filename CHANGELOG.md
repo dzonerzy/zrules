@@ -5,6 +5,17 @@ All notable changes to zrules are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] - 2026-10-01
+
+### Added
+- **Broken code:** `check()`, `analyze()` and `analyze_project()` take `recover=True` to parse text with zgram's error recovery, and accept trees parsed that way (`parser.parse_tree(text, recover=True)`). The tree's syntax errors are in the diagnostics, in source order among the findings, and nothing is reported about the broken text or because of it: no finding touching an error node or a syntax error, no flow findings in a function (or the top level) whose own body has broken text, no undefined, unused or missing-member name that occurs in the broken text, and no missing export for a name in the broken text of the file imported from.
+
+### Fixed
+- **A list literal with an item of unknown type** was typed from its other items: `[x, 1]` with `x` unknown became `list[int]`, and then a mistake wherever a `list[float]` was expected. It is now a list of unknown, which fits anywhere; the known items are still checked against each other.
+
+### Changed
+- Requires zgram-py 0.3.1 or later.
+
 ## [0.1.1] - 2026-09-30
 
 ### Changed

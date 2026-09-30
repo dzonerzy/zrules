@@ -435,10 +435,23 @@ The function receives the zgram `Node` and a context:
 rules.check(tree)        # a zgram Tree (parser.parse_tree(text))
 rules.check(node)        # a zgram Node (its whole tree is checked)
 rules.check(source)      # str or bytes: parsed first; raises zgram.ParseError
+rules.check(source, recover=True)   # parsed with zgram's error recovery
 rules.analyze(...)       # the same, returning an Analysis
 ```
 
 `check()` returns a list of `zgram.Diagnostic` in source order. The tree must come from the grammar the rules were compiled against.
+
+### Broken code
+
+An editor checks code while it is being typed, so it is often broken. With `recover=True` (or a tree from zgram's `parser.parse_tree(text, recover=True)`), a syntax error doesn't stop the check: the syntax errors are in the diagnostics with everything else, and the rules say nothing about the broken text, or because of it.
+
+```python
+rules.check("let b = * 2;\nprint(b);\nprint(nope);\n", recover=True)
+# 1:9  error: expected expr [syntax]
+# 3:7  error: undefined name 'nope' [undefined-name]
+```
+
+`b` isn't reported as undefined: it is defined in the statement that didn't parse. For the same reason, a function whose body has broken text gets no flow findings (its `return` may be the part that didn't parse), and a call with a broken argument no arity error. `analyze_project(files, recover=True)` does the same for each file, and doesn't report a missing export for a name in the other file's broken text.
 
 zrules reads the tree in place through zgram's `zgram.tree.v1` capsule; no Python object is created per node (custom rules get a `Node` for each node they are called on). `zrules.TREE_ABI` is the tree layout version it understands.
 
@@ -454,9 +467,9 @@ The [reference](https://github.com/dzonerzy/zrules/blob/main/docs/reference.md) 
 | `types(...)` | type inference and checking |
 | `flow(...)` | unreachable code, missing returns, variables without a value |
 | `custom(selector, function)` | a rule written in Python |
-| `rules.check(source)` | the diagnostics of a file, in source order |
-| `rules.analyze(source)` | the same, with the symbol table and types |
-| `rules.analyze_project(files, resolve=None)` | several files together, in parallel |
+| `rules.check(source, recover=False)` | the diagnostics of a file, in source order |
+| `rules.analyze(source, recover=False)` | the same, with the symbol table and types |
+| `rules.analyze_project(files, resolve=None, recover=False)` | several files together, in parallel |
 
 ## Architecture
 
@@ -525,6 +538,7 @@ test/
   test_project.py       # analyze_project(): imports, exports, cycles
   test_types.py         # types(): inference, checks, options, depth, scale
   test_flow.py          # flow(): unreachable code, returns, unassigned variables
+  test_recover.py       # Trees with syntax errors (zgram's recover=True)
   test_custom.py        # Rules written in Python
   test_parallel.py      # Parallel projects give the results of one thread
   test_example_*.py     # The tiny, typed and Lua examples

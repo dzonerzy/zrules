@@ -1,10 +1,115 @@
+<div align="center">
+
+<img src="https://raw.githubusercontent.com/dzonerzy/zrules/main/docs/assets/logo.svg" alt="zrules Logo" width="150">
+
 # zrules
 
-**Static rules over [zgram](https://github.com/dzonerzy/zgram) parse trees.**
+**Static semantics for languages parsed with [zgram](https://github.com/dzonerzy/zgram).**
 
-zgram tells you whether a text is well-formed. zrules tells you whether it is *valid*: `break` only inside a loop, no duplicate parameters, `len()` takes one argument. You write each check as one line; zrules runs them natively over zgram's parse tree and reports every violation as a `zgram.Diagnostic`.
+zgram tells you whether a program is well-formed. zrules tells you whether it is *valid*: names, scopes, types, control flow and any rule you can write as a selector, checked natively over zgram's parse tree and reported as diagnostics.
 
-It covers five levels of checking: one-line structural rules, name resolution with scopes (which also gives you a symbol table, within a file or across a project), type checking, control flow (unreachable code, missing returns, variables used before they have a value), and custom rules written as Python functions. Part of zsuite (zgram, zrules, zrun, zlsp).
+[![GitHub Stars](https://img.shields.io/github/stars/dzonerzy/zrules?style=flat)](https://github.com/dzonerzy/zrules)
+[![Python](https://img.shields.io/badge/python-3.10+-blue)](https://www.python.org/)
+[![Zig](https://img.shields.io/badge/zig-0.16+-orange)](https://ziglang.org/)
+[![License](https://img.shields.io/badge/license-MIT-green)](https://github.com/dzonerzy/zrules/blob/main/LICENSE)
+
+Built with [PyOZ](https://github.com/pyozig/PyOZ)
+
+</div>
+
+---
+
+zrules checks five levels, each one a rule you add to a list:
+
+- **Structural rules** in one line each: `break` only inside a loop, unique parameters, `len()` takes one argument.
+- **Names and scopes:** undefined, redefined, unused and shadowed names, member access, imports between files, and the symbol table an interpreter or an editor needs.
+- **Types:** inference, calls, operators, optionals, generics, declared types with fields and methods, across files.
+- **Control flow:** unreachable code, functions that may end without returning, variables read before they have a value.
+- **Custom rules** as Python functions, for anything else.
+
+Part of zsuite: zgram (syntax), zrules (semantics), zrun (execution), zlsp (editor support).
+
+## Performance
+
+zrules reads zgram's tree in place through its native capsule, with no Python object per node, and each rule visits only the nodes its selector can end on. On a typed program of 773 KB and 265,000 nodes, which zgram parses in 4.6 ms:
+
+| Rules | Time |
+|---|---|
+| `scopes()` | 3.1 ms |
+| `scopes()` + `types()` | 11 ms |
+| `scopes()` + `types()` + `flow()` | 15 ms |
+
+Whole projects are checked in parallel, with the Python lock released:
+
+| Project | `analyze_project()` | One file after another |
+|---|---|---|
+| 480 typed modules importing one another (1.6 million nodes) | 35 ms | 69 ms |
+| 8,000 small files importing one another | 47 ms | |
+
+### A real language
+
+[examples/lua](https://github.com/dzonerzy/zrules/tree/main/examples/lua) checks Lua 5.4: a complete grammar in zgram, and in zrules the errors `luac` reports beyond syntax (`break` outside a loop, `...` outside a vararg function, assignment to a `<const>` variable, `goto` without a visible label, duplicate labels) plus a linter's warnings (unused and shadowed locals, locals read before they are given a value, unreachable code).
+
+The test suite runs it over the Lua code shipped with nmap and sysdig: 830 files and 7 MB of code in production use, checked in 50 ms after a 36 ms parse. Every file parses, nothing in them is reported as an error, and the warnings that were checked by hand are real (code after an `if` whose branches all return, locals that are never read).
+
+### A typed language
+
+[examples/typed](https://github.com/dzonerzy/zrules/tree/main/examples/typed) is a statically typed language with structs, methods, optionals, lists and imports between files. Its whole front end after parsing is about a hundred lines of rule options: structure, names, types and flow.
+
+```
+$ python examples/typed/typedlang.py geometry.ty mistakes.ty
+mistakes.ty:1:42: error: module 'geometry' has no 'area' [no-export]
+mistakes.ty:3:4: error: 'describe' may end without returning a value [missing-return]
+mistakes.ty:14:12: error: 'result' may be used before it has a value [unassigned]
+mistakes.ty:15:5: warning: unreachable code [unreachable]
+mistakes.ty:19:31: error: argument 1 of start.plus(): expected 'Point', got 'int' [bad-argument]
+mistakes.ty:20:38: error: 'Point' has no field 'z' [no-field]
+mistakes.ty:21:17: error: operator '+' cannot be applied to 'str' and 'int' [bad-operand]
+...
+```
+
+### A small language
+
+[examples/tiny](https://github.com/dzonerzy/zrules/tree/main/examples/tiny) is a small language with functions, loops and variables. zgram parses it, the rules find every static error in one pass (`break` outside a loop, undefined names, duplicate definitions, wrong argument counts, calling a variable), and the interpreter then looks variables up through the symbols zrules resolved instead of searching scopes itself.
+
+```
+$ python examples/tiny/tiny.py bad.tiny
+bad.tiny:2:9: error: add() takes 2 arguments, got 1 [arity]
+    2 | let x = add(1);
+      |         ^^^^^^
+bad.tiny:3:1: error: 'break' outside loop [break-outside-loop]
+    3 | break;
+      | ^^^^^^
+```
+
+## Installation
+
+```bash
+pip install zrules-py
+```
+
+Like every zsuite package, it is named `<name>-py` on PyPI; the module is `zrules`:
+
+```python
+import zrules
+```
+
+It installs `zgram-py` 0.2.1 or newer with it. Prebuilt wheels cover CPython 3.10+ on **x86_64 Linux** (glibc 2.17+) and **x86_64 Windows**.
+
+### From source
+
+Requires [Zig](https://ziglang.org/) 0.16. `pip install .` builds through the [PyOZ](https://github.com/pyozig/PyOZ) build backend.
+
+```bash
+pip install pyoz
+pyoz build --release     # builds the wheel into dist/
+pip install dist/*.whl
+python -m pytest test
+```
+
+`zig build -Doptimize=ReleaseFast` alone produces `zig-out/lib/zrules.so` for quick iteration.
+
+## Quick Start
 
 ```python
 import zgram
@@ -38,15 +143,7 @@ program.z:1:14: error: 'break' outside loop [break-outside-loop]
       |              ^^^^^^
 ```
 
-Every option, class member and diagnostic code is listed in the [reference](docs/reference.md).
-
-## Installation
-
-```bash
-pip install zrules-py
-```
-
-Like every zsuite package, it is named `<name>-py` on PyPI; the module is `zrules` (`import zrules`). It installs `zgram-py` 0.2.1 or newer with it. Wheels cover CPython 3.10+ on x86_64 Linux and Windows.
+Every option, class member and diagnostic code is listed in the [reference](https://github.com/dzonerzy/zrules/blob/main/docs/reference.md).
 
 ## Selectors
 
@@ -62,7 +159,6 @@ A selector picks nodes of the parse tree, in the spirit of CSS.
 | `call[name=len]` | a `call` with a direct child labelled `name` whose text is `len` |
 | `call > ident` | an `ident` that is a direct child of a `call` |
 | `funcdef ident` | an `ident` anywhere inside a `funcdef` |
-
 | `call:not(.value)` | a `call` that is not labelled `value` (any single part can be negated) |
 | `call:has(> .args)` | a `call` with a child labelled `args`; `:has(x)` without `>` looks at all descendants |
 | `.params:nth(2)` | the second `.params` among its siblings; also `:first` and `:last` |
@@ -346,74 +442,99 @@ rules.analyze(...)       # the same, returning an Analysis
 
 zrules reads the tree in place through zgram's `zgram.tree.v1` capsule; no Python object is created per node (custom rules get a `Node` for each node they are called on). `zrules.TREE_ABI` is the tree layout version it understands.
 
-### Performance
+## API Reference
 
-Each rule visits only the nodes its selector can end on, found through an index by grammar rule and by label. On a 136 KB source (44,000 nodes), where zgram's parse takes about 0.3 ms:
+The [reference](https://github.com/dzonerzy/zrules/blob/main/docs/reference.md) lists every option of every rule with its default, every member of `Rules`, `Analysis`, `Symbol`, `Project` and the custom-rule context, every diagnostic code, and the limits.
 
-| | Time |
+| | |
 |---|---|
-| 4 structural rules | 0.4 ms |
-| 19 structural rules | 0.9 ms |
-| `scopes()` resolving 8,000 definitions and 16,000 uses (34,000 nodes) | 1.3 ms |
-| a typed program of 773 KB and 265,000 nodes (zgram parses it in 4.6 ms): `scopes()` | 3.1 ms |
-| the same with `types()` | 11 ms |
-| the same with `types()` and `flow()` | 15 ms |
-| the Lua checker of [examples/lua](examples/lua) on 830 real files (7.2 MB, 740,000 nodes; parsing them takes 36 ms) | 50 ms |
-| `analyze_project()` on 480 typed modules importing one another (1.6 million nodes) | 35 ms, against 69 ms for the files one after another |
-| `analyze_project()` on 8,000 small files importing one another | 47 ms |
+| `Rules(parser, rules)` | compile rules against a zgram parser's grammar |
+| `inside`, `unique`, `forbid`, `require`, `count` | structural rules |
+| `scopes(...)` | names, scopes, members, imports |
+| `types(...)` | type inference and checking |
+| `flow(...)` | unreachable code, missing returns, variables without a value |
+| `custom(selector, function)` | a rule written in Python |
+| `rules.check(source)` | the diagnostics of a file, in source order |
+| `rules.analyze(source)` | the same, with the symbol table and types |
+| `rules.analyze_project(files, resolve=None)` | several files together, in parallel |
 
-`Symbol` objects are created only when asked for (`symbols`, `resolve()`, `at()`), so `check()` pays nothing for them.
-
-`analyze_project()` checks the files in parallel: the structural rules, names and flow of each file on a thread of its own, and types in two steps (first, one thread works out what every file offers the others; then each file checks its own code on its own thread). The Python lock is released meanwhile. Up to 8 threads are used, one per 25,000 nodes: fewer for small projects, where starting threads would cost more than it saves. Rules written in Python still run one file after another.
-
-## Example: a whole language
-
-[examples/tiny](examples/tiny) is a small language with functions, loops and variables. zgram parses it, the rules above find every static error in one pass (`break` outside a loop, undefined names, duplicate definitions, wrong argument counts, calling a variable), and the interpreter then looks variables up through the symbols zrules resolved instead of searching scopes itself.
+## Architecture
 
 ```
-$ python examples/tiny/tiny.py bad.tiny
-bad.tiny:2:9: error: add() takes 2 arguments, got 1 [arity]
-    2 | let x = add(1);
-      |         ^^^^^^
-bad.tiny:3:1: error: 'break' outside loop [break-outside-loop]
-    3 | break;
-      | ^^^^^^
+zgram Tree (zgram.tree.v1 capsule)
+     |
+     v
+[Index]            -- nodes by grammar rule and by label, parents (lib.zig, tree.zig)
+     |
+     v
+[Selectors]        -- each rule's candidates from the index, filtered (selector.zig)
+     |
+     v
+[Structural rules] -- inside / unique / forbid / require / count (lib.zig)
+     |
+     v
+[Names]            -- scopes, definitions, uses, members, imports (scopes.zig)
+     |
+     v
+[Types]            -- interned type table, inference, checks (types.zig)
+     |
+     v
+[Flow]             -- paths through sequences, branches, loops (flow.zig)
+     |
+     v
+[Python]           -- custom rules, zgram.Diagnostic objects, Analysis (lib.zig)
 ```
 
-## Example: a typed language
+Key implementation details:
 
-[examples/typed](examples/typed) is a statically typed language with structs, methods, optionals, lists and imports between files. Its whole front end after parsing is about a hundred lines of rule options: structure, names, types and flow.
+- **No object per node**: the whole check runs on zgram's flat node array. Custom rules are the only place a `Node` object is made, and `Symbol` objects are created only when asked for (`symbols`, `resolve()`, `at()`), so `check()` pays nothing for them.
+- **Indexed selectors**: a rule looks only at the nodes its selector can end on, found by grammar rule and by label; a list of selectors merges their matches in source order, and `a > b` checks a candidate's parent directly.
+- **Names by integer**: a name's text is hashed once; scopes are resolved through a (scope, name id) table, and each node's symbol is an array entry.
+- **Types interned**: equal types have equal ids, in a table shared by the files of a project. The checker recurses, but puts off anything deeper than 100 levels and works it out afterwards, so no input runs it out of stack.
+- **Flow in one walk**: control structures nest, so a single walk follows every path; per-variable states are bitsets, reused across branches.
+
+## Threads
+
+- `analyze_project()` checks files in parallel with the Python lock released: the structural rules, names and flow of each file on a thread of its own, and types in two steps (first, one thread works out what every file offers the others; then each file checks its own code on its own thread).
+- Up to 8 threads are used, one per 25,000 nodes: fewer for small projects, where starting threads would cost more than they save, and never more than 8, past which threads contend for memory.
+- Rules written in Python run one file after another, with the lock held.
+- Each check works in memory of its own. Don't add rules (`rules.add()`, `@rules.rule`) to a `Rules` object while another thread checks with it.
+
+## Known Issues
+
+- Every check is a whole-file check: there is no incremental mode. At about 0.06 ms per thousand nodes with names, types and flow, checking again after every change is cheap.
+- `flow()` does not look into control structures nested more than 256 deep; `goto` and labels are not followed.
+- Input nested too deeply for zgram to parse is a `zgram.ParseError`, before zrules sees it.
+
+## Project Structure
 
 ```
-$ python examples/typed/typedlang.py geometry.ty mistakes.ty
-mistakes.ty:1:42: error: module 'geometry' has no 'area' [no-export]
-mistakes.ty:3:4: error: 'describe' may end without returning a value [missing-return]
-mistakes.ty:14:12: error: 'result' may be used before it has a value [unassigned]
-mistakes.ty:15:5: warning: unreachable code [unreachable]
-mistakes.ty:19:31: error: argument 1 of start.plus(): expected 'Point', got 'int' [bad-argument]
-mistakes.ty:20:38: error: 'Point' has no field 'z' [no-field]
-mistakes.ty:21:17: error: operator '+' cannot be applied to 'str' and 'int' [bad-operand]
-...
+src/
+  lib.zig               # Python module: Rules, Analysis, Symbol, Project, Context; the check's passes
+  tree.zig              # zgram's tree as native code sees it (the zgram.tree.v1 capsule)
+  selector.zig          # Selector syntax and matching
+  scopes.zig            # Names: scopes, definitions, uses, members
+  types.zig             # Types: the interned table, inference, the checks
+  flow.zig              # Control flow: reachability, returns, variables without a value
+test/
+  conftest.py           # A small language with imports, enums and members
+  typed.py              # The typed language of examples/typed, for the types and flow tests
+  test_selectors.py     # Selector syntax and matching
+  test_rules.py         # inside / unique / forbid / require / count
+  test_scopes.py        # scopes(): resolution, members, symbol tables
+  test_project.py       # analyze_project(): imports, exports, cycles
+  test_types.py         # types(): inference, checks, options, depth, scale
+  test_flow.py          # flow(): unreachable code, returns, unassigned variables
+  test_custom.py        # Rules written in Python
+  test_parallel.py      # Parallel projects give the results of one thread
+  test_example_*.py     # The tiny, typed and Lua examples
+examples/tiny/          # A small language checked, then interpreted
+examples/typed/         # A typed language: structure, names, types and flow
+examples/lua/           # A Lua 5.4 grammar and checker
+docs/reference.md       # Every option, class member and diagnostic code
+build.zig               # Zig build configuration
+pyproject.toml          # Python package configuration
 ```
-
-## Example: a real language
-
-[examples/lua](examples/lua) checks Lua 5.4: a complete grammar in zgram, and in zrules the errors `luac` reports beyond syntax (`break` outside a loop, `...` outside a vararg function, assignment to a `<const>` variable, `goto` without a visible label, duplicate labels) plus a linter's warnings (unused and shadowed locals, locals read before they are given a value, unreachable code).
-
-The test suite runs it over the Lua code shipped with nmap and sysdig when they are installed: 830 files and 7 MB of code in production use. Every file parses, nothing in them is reported as an error, and the warnings that were checked by hand are real (code after an `if` whose branches all return, locals that are never read).
-
-## Building from source
-
-Requires [Zig](https://ziglang.org/) 0.16.
-
-```bash
-pip install pyoz
-pyoz build --release     # builds the wheel into dist/
-pip install dist/*.whl
-python -m pytest test
-```
-
-`pip install .` does the same through the PyOZ build backend, and `zig build` alone produces `zig-out/lib/zrules.so` for quick iteration.
 
 ## License
 

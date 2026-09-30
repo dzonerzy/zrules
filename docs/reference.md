@@ -252,5 +252,5 @@ What a custom rule's function (and `on_unresolved`) receives as `ctx`.
 - A grammar has at most 4096 rules and 255 labels (zgram's limits).
 - `flow()` does not look into control structures nested more than 256 deep.
 - Type texts in options nest at most 64 deep. Types in the source have no such limit, and neither have chains of definitions that depend on one another.
-- Every check is a whole-file check: there is no incremental mode. With names, types and flow it costs about 0.15 ms per thousand nodes, so a file is checked again on every change, and a project of thousands of files in well under a second.
+- Every check is a whole-file check: there is no incremental mode. With names, types and flow it costs about 0.06 ms per thousand nodes, so a file is checked again on every change, and a project of thousands of files in well under a second.
 - `zrules.TREE_ABI` is the version of zgram's tree layout this build reads; a tree with another version is refused with a `RuntimeError`.

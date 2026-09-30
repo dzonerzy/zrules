@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Message placeholders** `{field}`, `{parent}`, `{min}` and `{max}`.
 - **`on_unresolved=`** for `scopes()`: a function that decides about names that resolve to nothing.
 - **`scopes()`:** name resolution with nested scopes, outer definitions, hoisting, builtins, separate namespaces, and diagnostics for undefined, redefined, unused and shadowed names.
+- **Member access:** `scopes(members=...)` resolves `target.name` in the scope the target names (enums, modules, static members) and reports missing members.
 - **`rules.analyze()`** returns an `Analysis` with the diagnostics and the symbol table: `symbols`, `resolve(node)`, `at(offset)`.
 - **Custom rules:** `@rules.rule(selector)`, `rules.add()` and `custom()` call a Python function with the node and a context (`error`, `warning`, `note`, `resolve`).
 - **`examples/tiny`:** a small language whose static errors are all found by zrules.

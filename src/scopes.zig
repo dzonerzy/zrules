@@ -5,6 +5,11 @@
 //! node (or, for an "outer" definition such as a function's own name, to the
 //! scope above that one). A use is resolved through the scopes above it,
 //! innermost first.
+//!
+//! A member access `target.name` is resolved in the scope its target names:
+//! an outer definition (a function's, an enum's, a module's own name) owns
+//! the scope its node sits in, and `name` is looked up among that scope's
+//! own definitions.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -31,16 +36,27 @@ pub const Symbol = struct {
     scope: u32,
     hoisted: bool,
     visible_from: u32 = 0,
+    /// The scope node this name stands for (an outer definition names the
+    /// scope its node is in); NONE if it has no members
+    owns: u32 = NONE,
     /// Nodes that use it, in source order
     uses: []const u32 = &.{},
 };
 
-pub const ProblemKind = enum { undefined, redefined, unused, shadowed };
+/// `target.name`: the access node and its two labelled children
+pub const Member = struct {
+    node: u32,
+    target: u32,
+    name: u32,
+};
+
+pub const ProblemKind = enum { undefined, redefined, unused, shadowed, no_member };
 
 pub const Problem = struct {
     kind: ProblemKind,
     node: u32,
-    /// redefined / shadowed: the earlier definition's node (NONE for a builtin)
+    /// redefined / shadowed: the earlier definition's node (NONE for a builtin).
+    /// no_member: the node defining the name that lacks the member.
     other: u32 = NONE,
 };
 
@@ -76,6 +92,7 @@ pub fn analyze(
     scopes: []const u32,
     definitions: []const Definition,
     uses: []const u32,
+    members: []const Member,
     builtins: []const []const u8,
     options: Options,
 ) !Result {
@@ -115,8 +132,19 @@ pub fn analyze(
         try symbols.append(arena, .{ .name = name, .node = NONE, .scope = NONE, .hoisted = true });
     }
 
+    // The name of a member access is looked up in its target's scope, not
+    // through the scopes around it
+    const is_member_name = try arena.alloc(bool, n_nodes);
+    @memset(is_member_name, false);
+    for (members) |m| is_member_name[m.name] = true;
+    // Uses that resolved, to group by symbol at the end
+    const is_resolved_use = try arena.alloc(bool, n_nodes);
+    @memset(is_resolved_use, false);
+
     for (definitions) |d| {
         var scope = above[d.node];
+        // An outer definition names the scope its node is in
+        const owns = if (d.outer) scope else NONE;
         if (d.outer and scope != NONE) scope = above[scope];
         const name = t.text(d.node);
         const id = (try names.getOrPutValue(arena, name, names.count())).value_ptr.*;
@@ -129,7 +157,7 @@ pub fn analyze(
         }
         entry.value_ptr.* = @intCast(symbols.items.len);
         by_node[d.node] = entry.value_ptr.*;
-        try symbols.append(arena, .{ .name = name, .node = d.node, .scope = scope, .hoisted = d.hoisted, .visible_from = d.visible_from });
+        try symbols.append(arena, .{ .name = name, .node = d.node, .scope = scope, .hoisted = d.hoisted, .visible_from = d.visible_from, .owns = owns });
         if (options.report_shadowed) {
             var outer_scope = scope;
             while (outer_scope != NONE) {
@@ -147,7 +175,7 @@ pub fn analyze(
     @memset(use_count, 0);
     var resolved: usize = 0;
     for (uses) |use| {
-        if (is_definition[use]) continue;
+        if (is_definition[use] or is_member_name[use]) continue;
         const id = names.get(t.text(use)) orelse {
             try problems.append(arena, .{ .kind = .undefined, .node = use });
             continue;
@@ -166,6 +194,7 @@ pub fn analyze(
         };
         if (found) |index| {
             by_node[use] = index;
+            is_resolved_use[use] = true;
             use_count[index + 1] += 1;
             resolved += 1;
         } else {
@@ -173,14 +202,39 @@ pub fn analyze(
         }
     }
 
+    // Member accesses, innermost first (in `a.b.c` the node for `a.b` comes
+    // after the node for the whole, so go backwards)
+    var mi = members.len;
+    while (mi > 0) {
+        mi -= 1;
+        const m = members[mi];
+        const target = by_node[m.target];
+        if (target == NONE) continue; // unknown or already reported
+        const owner = symbols.items[target];
+        // Not something with members known here (a variable, say): not ours to judge
+        if (owner.owns == NONE) continue;
+        const found: ?u32 = if (names.get(t.text(m.name))) |id| table.get(key(owner.owns, id)) else null;
+        if (found) |index| {
+            by_node[m.name] = index;
+            by_node[m.node] = index;
+            if (!is_definition[m.name]) {
+                is_resolved_use[m.name] = true;
+                use_count[index + 1] += 1;
+                resolved += 1;
+            }
+        } else {
+            try problems.append(arena, .{ .kind = .no_member, .node = m.name, .other = owner.node });
+        }
+    }
+
     // Group the uses by symbol: one array, each symbol a slice of it
     for (1..use_count.len) |i| use_count[i] += use_count[i - 1];
     const all_uses = try arena.alloc(u32, resolved);
     const next = try arena.dupe(u32, use_count[0..symbols.items.len]);
-    for (uses) |use| {
-        const index = by_node[use];
-        if (index == NONE or is_definition[use]) continue;
-        all_uses[next[index]] = use;
+    for (is_resolved_use, 0..) |yes, node| {
+        if (!yes) continue;
+        const index = by_node[node];
+        all_uses[next[index]] = @intCast(node);
         next[index] += 1;
     }
     for (symbols.items, 0..) |*sym, i| sym.uses = all_uses[use_count[i]..use_count[i + 1]];

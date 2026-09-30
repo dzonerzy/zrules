@@ -162,7 +162,7 @@ class TestSymbols:
 
         classes = {
             name: make_dataclass(name, fields.split())
-            for name, fields in dict(Program="body", FuncDef="name params body", While="cond body", Return="value", Break="", Let="name value", BinOp="left op right", Call="name args", Name="text").items()
+            for name, fields in dict(Program="body", FuncDef="name params body", While="cond body", Return="value", Break="", Let="name value", BinOp="left op right", Call="name args", Name="text", Enum="name members", Member="target name").items()
         }
         import conftest
 
@@ -294,3 +294,80 @@ class TestUnresolved:
         del rules
         gc.collect()
         assert sys.getrefcount(hook) == before
+
+
+class TestMembers:
+    SRC = """enum color { red green }
+enum shape { round }
+let c = color.red;
+let bad = color.blue;
+shape.round; shape.red;
+"""
+
+    def rules(self, parser, **kwargs):
+        return make(
+            parser,
+            scope=("Program", "FuncDef", "Enum"),
+            define=("Let > .name", "FuncDef > .params", "Enum > .members"),
+            define_outer=("FuncDef > .name", "Enum > .name"),
+            members="Member",
+            **kwargs,
+        )
+
+    def test_missing_member(self, parser):
+        ds = self.rules(parser).check(self.SRC)
+        assert [(d.code, d.message, d.line, d.column) for d in ds] == [
+            ("no-member", "'color' has no member 'blue'", 4, 17),
+            ("no-member", "'shape' has no member 'red'", 5, 20),
+        ]
+        assert [(n.message, n.line, n.column) for n in ds[0].notes] == [("defined here", 1, 6)]
+
+    def test_members_are_not_visible_unqualified(self, parser):
+        assert found(self.rules(parser), "enum color { red } red;") == [("undefined-name", 1, 20, "red")]
+
+    def test_member_symbols(self, parser):
+        analysis = self.rules(parser).analyze(self.SRC)
+        by_name = {(s.name, s.scope): s for s in analysis.symbols}
+        color = by_name[("color", 0)]
+        red = [s for s in analysis.symbols if s.name == "red"][0]
+        assert analysis.tree.node(color.owns).rule() == "enum_def"
+        assert red.scope == color.owns and red.owns is None
+        assert len(color.uses) == 2 and len(red.uses) == 1
+        # the name and the whole access both resolve to the member
+        member = analysis.tree.root.find("member")[0]
+        assert analysis.resolve(member) is red
+        assert analysis.resolve(member.get("name")) is red
+        assert analysis.resolve(member.get("target")) is color
+
+    def test_chained_access(self, parser):
+        src = "enum outer { enum inner { leaf } } outer.inner.leaf; outer.inner.nope; outer.leaf;"
+        ds = self.rules(parser).check(src)
+        assert [d.message for d in ds] == ["'inner' has no member 'nope'", "'outer' has no member 'leaf'"]
+
+    def test_access_on_a_variable_is_left_alone(self, parser):
+        # what a variable holds is a question for types, not for names
+        assert self.rules(parser).check("let v = 1; v.anything;") == []
+
+    def test_access_on_an_undefined_name_reports_only_the_name(self, parser):
+        assert [d.message for d in self.rules(parser).check("nope.x;")] == ["undefined name 'nope'"]
+
+    def test_function_locals_are_members_of_nothing_useful(self, parser):
+        # a function name owns its scope too: f.x finds its parameter
+        assert self.rules(parser).check("fn f(x) {} f.x;") == []
+        assert [d.message for d in self.rules(parser).check("fn f(x) {} f.y;")] == ["'f' has no member 'y'"]
+
+    def test_levels_messages_and_codes(self, parser):
+        assert self.rules(parser, on_no_member="ignore").check(self.SRC) == []
+        rules = self.rules(parser, on_no_member="warning", messages={"no_member": "{owner}::{text}?"}, codes={"no_member": "E7"})
+        d = rules.check(self.SRC)[0]
+        assert (d.severity, d.code, d.message) == ("warning", "E7", "color::blue?")
+
+    def test_member_labels(self, parser):
+        with pytest.raises(ValueError, match="no label 'object'"):
+            self.rules(parser, member_labels=("object", "name"))
+        with pytest.raises(ValueError, match="two labels"):
+            self.rules(parser, member_labels=("target",))
+
+    def test_without_members_option_names_after_a_dot_are_plain_uses(self, parser):
+        rules = make(parser, scope=("Program", "Enum"), define="Enum > .members", define_outer="Enum > .name")
+        assert [d.message for d in rules.check("enum color { red } color.red;")] == ["undefined name 'red'"]

@@ -120,9 +120,25 @@ scopes(
 
 Each is `"error"`, `"warning"` or `"ignore"`. For names the declarative options can't account for (names provided by the host, implicit globals), `on_unresolved=function` is asked about every use that resolves to nothing: `function(node, ctx)` returns true if the name is fine after all, and may report its own diagnostic through `ctx`.
 
-Languages where assignment defines a variable need no special support: list the assignment target in `define` and set `on_redefine="ignore"`; the first assignment is the definition. `messages={"undefined": "unknown variable '{text}'"}` and `codes={"undefined": "E100"}` override the texts and codes, with the keys `undefined`, `redefined`, `unused` and `shadowed`.
+Languages where assignment defines a variable need no special support: list the assignment target in `define` and set `on_redefine="ignore"`; the first assignment is the definition. `messages={"undefined": "unknown variable '{text}'"}` and `codes={"undefined": "E100"}` override the texts and codes, with the keys `undefined`, `redefined`, `unused`, `shadowed` and `no_member`.
 
 Several `scopes()` rules give separate namespaces; name them with `namespace="function"`.
+
+### Member access
+
+`members=` resolves qualified names such as `Color.red` or `module.function`:
+
+```python
+scopes(
+    scope=("Program", "Enum"),
+    define="Enum > .members",
+    define_outer="Enum > .name",     # `Color` names the enum's scope
+    use="Name",
+    members="Member",                # nodes with a child labelled `target` and one labelled `name`
+)
+```
+
+A name defined with `define_outer` stands for the scope its node is in, and that scope's own definitions are its members. In `target.name`, `name` is looked up among the members of what `target` resolves to, and nowhere else: `Color.blue` is reported as `'Color' has no member 'blue'` (`on_no_member`, code `no-member`), and `red` alone stays undefined. Chains (`a.b.c`) resolve left to right. When the target is something without members known to the scopes, a variable for instance, the access is left alone. `member_labels=("object", "attr")` changes the two labels.
 
 ### The symbol table
 
@@ -140,7 +156,7 @@ analysis.at(offset)         # the Symbol defined or used at a byte offset, or No
 
 `resolve()` takes a zgram `Node`, a node index, or an AST object built by zgram (it reads `__znode__`), so an interpreter can look variables up by symbol and an editor can implement go-to-definition with `at()`.
 
-A `Symbol` has `name`, `namespace`, `builtin`, `node` and `span` (its definition; `None` for a builtin), `scope` (the index of its scope node; `None` for the global scope), and `uses` / `use_spans`.
+A `Symbol` has `name`, `namespace`, `builtin`, `node` and `span` (its definition; `None` for a builtin), `scope` (the index of its scope node; `None` for the global scope), `owns` (the index of the scope it names, if it has members), and `uses` / `use_spans`.
 
 ## Custom rules
 

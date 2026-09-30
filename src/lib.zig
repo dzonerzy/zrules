@@ -167,6 +167,9 @@ fn scopes(args: pyoz.Args(struct {
     on_redefine: ?*PyObject = null,
     on_unused: ?*PyObject = null,
     on_shadow: ?*PyObject = null,
+    on_no_member: ?*PyObject = null,
+    members: ?*PyObject = null,
+    member_labels: ?*PyObject = null,
     on_unresolved: ?*PyObject = null,
     messages: ?*PyObject = null,
     codes: ?*PyObject = null,
@@ -178,7 +181,8 @@ fn scopes(args: pyoz.Args(struct {
         .{ "ordered", a.ordered },           .{ "namespace", a.namespace },     .{ "on_undefined", a.on_undefined },
         .{ "on_redefine", a.on_redefine },   .{ "on_unused", a.on_unused },     .{ "on_shadow", a.on_shadow },
         .{ "messages", a.messages },         .{ "codes", a.codes },             .{ "after", a.after },
-        .{ "on_unresolved", a.on_unresolved },
+        .{ "on_unresolved", a.on_unresolved }, .{ "members", a.members },             .{ "member_labels", a.member_labels },
+        .{ "on_no_member", a.on_no_member },
     }) };
 }
 
@@ -199,7 +203,7 @@ fn custom(args: pyoz.Args(struct {
 const Level = enum { ignore, warning, err };
 
 /// A compiled scopes() rule. Problem kinds index the arrays in the order of
-/// scopes_mod.ProblemKind: undefined, redefined, unused, shadowed.
+/// scopes_mod.ProblemKind: undefined, redefined, unused, shadowed, no_member.
 const ScopeRule = struct {
     namespace: []const u8,
     scope: []const Selector,
@@ -209,11 +213,15 @@ const ScopeRule = struct {
     hoist: []const Selector,
     /// Definitions visible only after their parent node (the declaration) ends
     after: []const Selector,
+    /// Member accesses (`target.name`), and the field ids of those two children
+    members: []const Selector,
+    member_target: u8,
+    member_name: u8,
     builtins: []const []const u8,
     ordered: bool,
-    levels: [4]Level,
-    messages: [4][]const u8,
-    codes: [4][]const u8,
+    levels: [5]Level,
+    messages: [5][]const u8,
+    codes: [5][]const u8,
     /// Called with (node, ctx) for a use that resolves to nothing; a true
     /// result means the language knows the name after all. A strong reference.
     on_unresolved: ?*PyObject = null,
@@ -292,6 +300,8 @@ const Symbol = struct {
     _end: i64 = 0,
     /// Index of the node whose scope it is defined in; -1 = the global scope
     _scope: i64 = -1,
+    /// Index of the scope node it names (whose definitions are its members); -1 = none
+    _owns: i64 = -1,
     /// list[int]: the nodes that use it, and list[(start, end)]: their spans
     _uses: ?*PyObject = null,
     _use_spans: ?*PyObject = null,
@@ -327,6 +337,10 @@ const Symbol = struct {
         return if (self._scope < 0) null else self._scope;
     }
 
+    pub fn get_owns(self: *const Symbol) ?i64 {
+        return if (self._owns < 0) null else self._owns;
+    }
+
     pub fn get_uses(self: *const Symbol) pyoz.Signature(?*PyObject, "list[int]") {
         return .{ .value = ownedOrNone(self._uses) };
     }
@@ -346,7 +360,7 @@ const Symbol = struct {
         return std.fmt.bufPrint(buf, "Symbol('{s}', defined at {d}..{d}, {d} uses)", .{ name, self._start, self._end, uses }) catch buf[0..0];
     }
 
-    pub const __doc__: [*:0]const u8 = "A name found by a scopes() rule: name, namespace, node and span of its definition (None for a builtin), scope (the node index of its scope, None for the global scope), uses and use_spans.";
+    pub const __doc__: [*:0]const u8 = "A name found by a scopes() rule: name, namespace, node and span of its definition (None for a builtin), scope (the node index of its scope, None for the global scope), owns (the node index of the scope it names, whose definitions are its members, or None), uses and use_spans.";
 };
 
 /// The node index an object stands for: an int, a zgram Node (its `index`)
@@ -418,6 +432,7 @@ const AnalysisData = struct {
             ._name = py.PyUnicode_FromStringAndSize(sym.name.ptr, @intCast(sym.name.len)),
             ._namespace = py.PyUnicode_FromStringAndSize(result.namespace.ptr, @intCast(result.namespace.len)),
             ._scope = if (sym.scope == NONE) -1 else sym.scope,
+            ._owns = if (sym.owns == NONE) -1 else sym.owns,
             ._uses = uses,
             ._use_spans = spans,
         };
@@ -783,10 +798,10 @@ const Rules = struct {
         return @intCast(v);
     }
 
-    const problem_keys = [4][:0]const u8{ "undefined", "redefined", "unused", "shadowed" };
+    const problem_keys = [5][:0]const u8{ "undefined", "redefined", "unused", "shadowed", "no_member" };
 
     /// messages= / codes=: a dict overriding some of `defaults`, by problem kind.
-    fn problemTexts(state: *State, args: *PyObject, key: [*:0]const u8, defaults: [4][]const u8) ?[4][]const u8 {
+    fn problemTexts(state: *State, args: *PyObject, key: [*:0]const u8, defaults: [5][]const u8) ?[5][]const u8 {
         var out = defaults;
         const dict = py.c.PyDict_GetItemString(args, key) orelse return out;
         if (!py.PyDict_Check(dict)) {
@@ -804,7 +819,7 @@ const Rules = struct {
                 };
             }
             if (known != py.c.PyDict_Size(dict)) {
-                raise(py.PyExc_ValueError(), "{s}: the keys are 'undefined', 'redefined', 'unused' and 'shadowed'", .{std.mem.span(key)});
+                raise(py.PyExc_ValueError(), "{s}: the keys are 'undefined', 'redefined', 'unused', 'shadowed' and 'no_member'", .{std.mem.span(key)});
                 return null;
             }
         }
@@ -829,8 +844,34 @@ const Rules = struct {
         };
         const ordered = if (py.c.PyDict_GetItemString(args, "ordered")) |o| py.c.PyObject_IsTrue(o) != 0 else true;
         const builtins: []const []const u8 = if (py.c.PyDict_GetItemString(args, "builtins")) |b| strings(arena, b, "builtins", false) orelse return null else &.{};
+        // Labels of a member access's two children: ("target", "name") by default
+        var member_labels = [2][]const u8{ "target", "name" };
+        if (py.c.PyDict_GetItemString(args, "member_labels")) |labels| {
+            const given = strings(arena, labels, "member_labels", false) orelse return null;
+            if (given.len != 2) {
+                raise(py.PyExc_ValueError(), "member_labels must be two labels: (target, name)", .{});
+                return null;
+            }
+            member_labels = .{ given[0], given[1] };
+        }
+        const member_selectors = compileSelectors(state, py.c.PyDict_GetItemString(args, "members"), "members") orelse return null;
+        var member_ids = [2]u8{ 0, 0 };
+        if (member_selectors.len != 0) {
+            for (member_labels, 0..) |label, i| {
+                for (state.names.fields, 1..) |f, id| {
+                    if (std.mem.eql(u8, f, label)) member_ids[i] = @intCast(id);
+                }
+                if (member_ids[i] == 0) {
+                    raise(py.PyExc_ValueError(), "members: the grammar has no label '{s}' (set member_labels=(target, name))", .{label});
+                    return null;
+                }
+            }
+        }
         sr.* = .{
             .namespace = textArg(state, args, "namespace", "name") orelse return null,
+            .members = member_selectors,
+            .member_target = member_ids[0],
+            .member_name = member_ids[1],
             .scope = compileSelectors(state, py.c.PyDict_GetItemString(args, "scope"), "scope") orelse return null,
             .define = compileSelectors(state, py.c.PyDict_GetItemString(args, "define"), "define") orelse return null,
             .define_outer = compileSelectors(state, py.c.PyDict_GetItemString(args, "define_outer"), "define_outer") orelse return null,
@@ -844,14 +885,16 @@ const Rules = struct {
                 levelArg(args, "on_redefine", .err) orelse return null,
                 levelArg(args, "on_unused", .ignore) orelse return null,
                 levelArg(args, "on_shadow", .ignore) orelse return null,
+                levelArg(args, "on_no_member", .err) orelse return null,
             },
             .messages = problemTexts(state, args, "messages", .{
                 "undefined name '{text}'",
                 "'{text}' is already defined",
                 "'{text}' is never used",
                 "'{text}' shadows an outer definition",
+                "'{owner}' has no member '{text}'",
             }) orelse return null,
-            .codes = problemTexts(state, args, "codes", .{ "undefined-name", "redefined-name", "unused-name", "shadowed-name" }) orelse return null,
+            .codes = problemTexts(state, args, "codes", .{ "undefined-name", "redefined-name", "unused-name", "shadowed-name", "no-member" }) orelse return null,
         };
         if (py.c.PyDict_GetItemString(args, "on_unresolved")) |f| {
             if (py.c.PyCallable_Check(f) == 0) {
@@ -1076,6 +1119,8 @@ const Rules = struct {
         /// {field}: its label ("" without one); {parent}: its parent's rule name
         field: []const u8 = "",
         parent: []const u8 = "",
+        /// {owner}: for a missing member, the name that lacks it
+        owner: []const u8 = "",
         /// {count}, and the {min} / {max} it was checked against
         count: u32 = 0,
         min: u32 = 0,
@@ -1090,7 +1135,7 @@ const Rules = struct {
         outer: while (i < template.len) {
             if (template[i] == '{') {
                 const rest = template[i..];
-                inline for (.{ "text", "rule", "field", "parent" }) |name| {
+                inline for (.{ "text", "rule", "field", "parent", "owner" }) |name| {
                     if (std.mem.startsWith(u8, rest, "{" ++ name ++ "}")) {
                         try out.appendSlice(arena, @field(v, name));
                         i += name.len + 2;
@@ -1325,11 +1370,25 @@ const Rules = struct {
                 }
             }.lt);
 
+            var members: std.ArrayList(scopes_mod.Member) = .empty;
+            for (try self.matchAll(sr.members)) |node| {
+                var target: u32 = NONE;
+                var name: u32 = NONE;
+                const stop = t.end(node);
+                var child = node + 1;
+                while (child < stop) : (child = t.end(child)) {
+                    const field = t.nodes[child].fieldId();
+                    if (field == sr.member_target and target == NONE) target = child;
+                    if (field == sr.member_name and name == NONE) name = child;
+                }
+                if (target != NONE and name != NONE) try members.append(self.arena, .{ .node = node, .target = target, .name = name });
+            }
+
             // The Analysis may outlive the Rules: names it keeps must live in its arena
             const builtins = try self.arena.alloc([]const u8, sr.builtins.len);
             for (builtins, sr.builtins) |*slot, name| slot.* = try self.arena.dupe(u8, name);
 
-            const result = try scopes_mod.analyze(self.arena, t, scope_nodes, defs.items, uses, builtins, .{
+            const result = try scopes_mod.analyze(self.arena, t, scope_nodes, defs.items, uses, members.items, builtins, .{
                 .ordered = sr.ordered,
                 .report_unused = sr.levels[@intFromEnum(scopes_mod.ProblemKind.unused)] != .ignore,
                 .report_shadowed = sr.levels[@intFromEnum(scopes_mod.ProblemKind.shadowed)] != .ignore,
@@ -1348,15 +1407,21 @@ const Rules = struct {
             const k = @intFromEnum(p.kind);
             if (sr.levels[k] == .ignore) return;
             const flat = t.nodes[p.node];
+            var v = self.values(p.node);
+            if (p.kind == .no_member and p.other != NONE) v.owner = t.text(p.other);
             var finding = Finding{
                 .start = flat.text_start,
                 .end = flat.text_end,
                 .severity = if (sr.levels[k] == .err) "error" else "warning",
                 .code = sr.codes[k],
-                .message = try format(self.arena, sr.messages[k], self.values(p.node)),
+                .message = try format(self.arena, sr.messages[k], v),
             };
             if (p.other != NONE) {
-                finding.note = if (p.kind == .shadowed) "the outer definition is here" else "first defined here";
+                finding.note = switch (p.kind) {
+                    .shadowed => "the outer definition is here",
+                    .no_member => "defined here",
+                    else => "first defined here",
+                };
                 finding.note_start = t.nodes[p.other].text_start;
                 finding.note_end = t.nodes[p.other].text_end;
                 finding.has_note = true;
@@ -1740,7 +1805,7 @@ pub const Module = pyoz.module(.{
         pyoz.func("forbid", forbid, "forbid(selector, message=None, code=None, severity=None): no node may match `selector`."),
         pyoz.func("require", require, "require(selector, message=None, code=None, severity=None): every node matching all but the last part of `selector` must have a match of the whole selector."),
         pyoz.func("count", count, "count(selector, exactly=None, min=None, max=None, message=None, code=None, severity=None): the number of matches within the node the selector's first part matched must be in range."),
-        pyoz.func("scopes", scopes, "scopes(scope, define, use, define_outer=None, hoist=None, after=None, builtins=None, ordered=True, namespace='name', on_undefined='error', on_redefine='error', on_unused='ignore', on_shadow='ignore', messages=None, codes=None): resolve names. `scope` nodes open a scope; `define` nodes define their text as a name in the scope around them (`define_outer`: in the scope outside that one); `use` nodes must resolve to a definition. `hoist` definitions are visible before their position; `after` definitions only once their parent node has ended."),
+        pyoz.func("scopes", scopes, "scopes(scope, define, use, define_outer=None, hoist=None, after=None, builtins=None, ordered=True, namespace='name', on_undefined='error', on_redefine='error', on_unused='ignore', on_shadow='ignore', on_no_member='error', members=None, member_labels=('target', 'name'), on_unresolved=None, messages=None, codes=None): resolve names. `scope` nodes open a scope; `define` nodes define their text as a name in the scope around them (`define_outer`: in the scope outside that one); `use` nodes must resolve to a definition. `hoist` definitions are visible before their position; `after` definitions only once their parent node has ended. `members` nodes are accesses like a.b: the child labelled name is looked up in the scope that the child labelled target names."),
         pyoz.func("custom", custom, "custom(selector, function, code=None): call function(node, ctx) for every node matching `selector`."),
         pyoz.func("version", version, "Return the zrules version string"),
     },

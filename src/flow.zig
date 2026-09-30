@@ -107,6 +107,10 @@ const Flow = struct {
     loop: ?*Loop = null,
     /// Assignments whose statement hasn't ended yet
     pending: std.ArrayList(Pending) = .empty,
+    /// Bitsets no longer in use
+    spare: std.ArrayList([]usize) = .empty,
+    /// Variables already reported (allocated at the first report)
+    reported: []usize = &.{},
 };
 
 pub const Analysis = struct {
@@ -344,15 +348,30 @@ pub const Analysis = struct {
 
     // ── States ──
 
-    fn fresh(self: *Analysis, flow: *const Flow, live: bool) Error!State {
-        const state = State{ .live = live, .all = try self.arena.alloc(usize, flow.words), .some = try self.arena.alloc(usize, flow.words) };
+    /// A bitset of the function's size: one given back, or a new one.
+    fn buffer(self: *Analysis, flow: *Flow) Error![]usize {
+        return flow.spare.pop() orelse try self.arena.alloc(usize, flow.words);
+    }
+
+    fn fresh(self: *Analysis, flow: *Flow, live: bool) Error!State {
+        const state = State{ .live = live, .all = try self.buffer(flow), .some = try self.buffer(flow) };
         @memset(state.all, 0);
         @memset(state.some, 0);
         return state;
     }
 
-    fn copy(self: *Analysis, state: State) Error!State {
-        return .{ .live = state.live, .all = try self.arena.dupe(usize, state.all), .some = try self.arena.dupe(usize, state.some) };
+    fn copy(self: *Analysis, flow: *Flow, state: State) Error!State {
+        const out = State{ .live = state.live, .all = try self.buffer(flow), .some = try self.buffer(flow) };
+        @memcpy(out.all, state.all);
+        @memcpy(out.some, state.some);
+        return out;
+    }
+
+    /// A state no path continues from: its bitsets serve the next one, so
+    /// the memory in use follows the nesting, not the number of branches.
+    fn release(self: *Analysis, flow: *Flow, state: State) Error!void {
+        try flow.spare.append(self.arena, state.all);
+        try flow.spare.append(self.arena, state.some);
     }
 
     /// Two paths join: a variable has a value if it has one on both (a path
@@ -452,9 +471,14 @@ pub const Analysis = struct {
             return;
         }
         if (!state.live or has(state.all, bit)) return;
+        // Said once per variable, whatever the path
+        if (flow.reported.len == 0) {
+            flow.reported = try self.arena.alloc(usize, flow.words);
+            @memset(flow.reported, 0);
+        }
+        if (has(flow.reported, bit)) return;
+        flow.reported[bit / @bitSizeOf(usize)] |= @as(usize, 1) << @intCast(bit % @bitSizeOf(usize));
         try self.report(if (has(state.some, bit)) .maybe_unassigned else .unassigned, node);
-        // Said once: the uses after this one are not reported again
-        give(state, bit);
     }
 
     fn sequence(self: *Analysis, node: u32, state: *State, flow: *Flow) Error!void {
@@ -493,15 +517,17 @@ pub const Analysis = struct {
                 try self.walk(c, state, flow);
                 continue;
             }
-            var arm = try self.copy(state.*);
+            var arm = try self.copy(flow, state.*);
             try self.walk(c, &arm, flow);
             if (flow.pending.items.len != 0) settle(flow, &arm, t.end(c));
             meet(&out, arm);
+            try self.release(flow, arm);
             // A nested branch stands for everything else: what it doesn't
             // cover is part of its own result
             if (self.flags[c].otherwise or self.kind[c] == .branch) exhaustive = true;
         }
         if (!exhaustive) meet(&out, state.*);
+        try self.release(flow, state.*);
         state.* = out;
     }
 
@@ -520,7 +546,7 @@ pub const Analysis = struct {
                 try self.walk(c, state, flow);
                 continue;
             }
-            before = try self.copy(state.*);
+            before = try self.copy(flow, state.*);
             const outer = flow.loop;
             flow.loop = &frame;
             try self.walk(c, state, flow);
@@ -529,12 +555,18 @@ pub const Analysis = struct {
             // The end of an iteration: the end of the body, or a `continue`
             meet(state, frame.continues);
         }
+        defer {
+            self.release(flow, frame.breaks) catch {};
+            self.release(flow, frame.continues) catch {};
+        }
         const skipped = before orelse return;
         var out = try self.fresh(flow, false);
         // What was given a value in the loop may have one afterwards
         for (out.some, state.some) |*a, b| a.* |= b;
         if (!flags.forever) meet(&out, if (flags.once) state.* else skipped);
         meet(&out, frame.breaks);
+        try self.release(flow, skipped);
+        try self.release(flow, state.*);
         state.* = out;
     }
 

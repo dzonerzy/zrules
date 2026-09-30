@@ -13,6 +13,7 @@ const tree_mod = @import("tree.zig");
 const selector = @import("selector.zig");
 const scopes_mod = @import("scopes.zig");
 const types_mod = @import("types.zig");
+const flow_mod = @import("flow.zig");
 const Tree = tree_mod.Tree;
 const Selector = selector.Selector;
 const NONE = tree_mod.NONE;
@@ -48,7 +49,7 @@ fn utf8(obj: *PyObject, what: []const u8) ?[]const u8 {
 // Rule: what inside(), unique(), ... return
 // ============================================================================
 
-const Kind = enum(u8) { inside, unique, forbid, require, count, scopes, custom, types };
+const Kind = enum(u8) { inside, unique, forbid, require, count, scopes, custom, types, flow };
 
 /// A rule as written, before it is compiled against a grammar by Rules().
 const Rule = struct {
@@ -245,9 +246,71 @@ fn types(args: pyoz.Args(struct {
     }) };
 }
 
+fn flow(args: pyoz.Args(struct {
+    sequences: ?*PyObject = null,
+    functions: ?*PyObject = null,
+    branches: ?*PyObject = null,
+    arms: ?*PyObject = null,
+    otherwise: ?*PyObject = null,
+    loops: ?*PyObject = null,
+    forever: ?*PyObject = null,
+    at_least_once: ?*PyObject = null,
+    exits: ?*PyObject = null,
+    breaks: ?*PyObject = null,
+    continues: ?*PyObject = null,
+    must_return: ?*PyObject = null,
+    variables: ?*PyObject = null,
+    assigns: ?*PyObject = null,
+    labels: ?*PyObject = null,
+    namespace: ?*PyObject = null,
+    on_unreachable: ?*PyObject = null,
+    on_missing_return: ?*PyObject = null,
+    on_unassigned: ?*PyObject = null,
+    messages: ?*PyObject = null,
+    codes: ?*PyObject = null,
+})) pyoz.Signature(?Rule, "Rule") {
+    const a = args.value;
+    return .{ .value = makeRule(.flow, .{
+        .{ "sequences", a.sequences },           .{ "functions", a.functions },                 .{ "branches", a.branches },
+        .{ "arms", a.arms },                     .{ "otherwise", a.otherwise },                 .{ "loops", a.loops },
+        .{ "forever", a.forever },               .{ "at_least_once", a.at_least_once },         .{ "exits", a.exits },
+        .{ "breaks", a.breaks },                 .{ "continues", a.continues },                 .{ "must_return", a.must_return },
+        .{ "variables", a.variables },           .{ "assigns", a.assigns },                     .{ "labels", a.labels },
+        .{ "namespace", a.namespace },           .{ "on_unreachable", a.on_unreachable },       .{ "on_missing_return", a.on_missing_return },
+        .{ "on_unassigned", a.on_unassigned },   .{ "messages", a.messages },                   .{ "codes", a.codes },
+    }) };
+}
+
 // ============================================================================
 // Compiled rules
 // ============================================================================
+
+const flow_problem_kinds = @typeInfo(flow_mod.ProblemKind).@"enum".fields.len;
+
+/// A compiled flow() rule. Problem kinds index the arrays in the order of
+/// flow_mod.ProblemKind: dead, missing_return, unassigned, maybe_unassigned.
+const FlowRule = struct {
+    /// The scopes() rule whose names it follows ("" = the first one)
+    namespace: []const u8,
+    sequences: []const Selector,
+    functions: []const Selector,
+    branches: []const Selector,
+    arms: []const Selector,
+    otherwise: []const Selector,
+    loops: []const Selector,
+    forever: []const Selector,
+    at_least_once: []const Selector,
+    exits: []const Selector,
+    breaks: []const Selector,
+    continues: []const Selector,
+    must_return: []const Selector,
+    variables: []const Selector,
+    assigns: []const Selector,
+    labels: flow_mod.Labels,
+    levels: [flow_problem_kinds]Level,
+    messages: [flow_problem_kinds][]const u8,
+    codes: [flow_problem_kinds][]const u8,
+};
 
 const type_problem_kinds = @typeInfo(types_mod.ProblemKind).@"enum".fields.len;
 
@@ -346,6 +409,8 @@ const CompiledRule = struct {
     scope: ?*const ScopeRule = null,
     /// types: its configuration
     types: ?*const TypeRule = null,
+    /// flow: its configuration
+    flow: ?*const FlowRule = null,
     /// custom: the Python function to call with (node, ctx); a strong reference
     callback: ?*PyObject = null,
 };
@@ -1484,7 +1549,100 @@ const Rules = struct {
         return tr;
     }
 
+    const flow_keys = [flow_problem_kinds][:0]const u8{ "unreachable", "missing_return", "unassigned", "maybe_unassigned" };
+
+    fn compileFlow(state: *State, args: *PyObject) ?*const FlowRule {
+        const arena = state.arena.allocator();
+        const fr = arena.create(FlowRule) catch {
+            _ = py.c.PyErr_NoMemory();
+            return null;
+        };
+
+        // Which label each child is read through: its role's name, unless overridden
+        var labels = flow_mod.Labels{};
+        const overrides = textPairs(state, args, "labels") orelse return null;
+        inline for (@typeInfo(flow_mod.Labels).@"struct".fields) |field| {
+            var label: []const u8 = field.name;
+            for (overrides) |pair| {
+                if (std.mem.eql(u8, pair[0], field.name)) label = pair[1];
+            }
+            for (state.names.fields, 1..) |f, id| {
+                if (std.mem.eql(u8, f, label)) @field(labels, field.name) = @intCast(id);
+            }
+        }
+        for (overrides) |pair| {
+            var known = false;
+            inline for (@typeInfo(flow_mod.Labels).@"struct".fields) |field| {
+                if (std.mem.eql(u8, pair[0], field.name)) known = true;
+            }
+            if (!known) {
+                raise(py.PyExc_ValueError(), "labels: unknown role '{s}': expected name, value or target", .{pair[0]});
+                return null;
+            }
+        }
+
+        var messages = [flow_problem_kinds][]const u8{
+            "unreachable code",
+            "'{text}' may end without returning a value",
+            "'{text}' is used before it has a value",
+            "'{text}' may be used before it has a value",
+        };
+        var codes = [flow_problem_kinds][]const u8{ "unreachable", "missing-return", "unassigned", "unassigned" };
+        inline for (.{ .{ "messages", &messages }, .{ "codes", &codes } }) |option| {
+            for (textPairs(state, args, option[0]) orelse return null) |pair| {
+                const at = for (flow_keys, 0..) |k, i| {
+                    if (std.mem.eql(u8, k, pair[0])) break i;
+                } else {
+                    raise(py.PyExc_ValueError(), "{s}: unknown kind '{s}': the keys are 'unreachable', 'missing_return', 'unassigned' and 'maybe_unassigned'", .{ option[0], pair[0] });
+                    return null;
+                };
+                option[1][at] = pair[1];
+            }
+        }
+        const unassigned = levelArg(args, "on_unassigned", .err) orelse return null;
+
+        fr.* = .{
+            .namespace = textArg(state, args, "namespace", "") orelse return null,
+            .sequences = compileSelectors(state, py.c.PyDict_GetItemString(args, "sequences"), "sequences") orelse return null,
+            .functions = compileSelectors(state, py.c.PyDict_GetItemString(args, "functions"), "functions") orelse return null,
+            .branches = compileSelectors(state, py.c.PyDict_GetItemString(args, "branches"), "branches") orelse return null,
+            .arms = compileSelectors(state, py.c.PyDict_GetItemString(args, "arms"), "arms") orelse return null,
+            .otherwise = compileSelectors(state, py.c.PyDict_GetItemString(args, "otherwise"), "otherwise") orelse return null,
+            .loops = compileSelectors(state, py.c.PyDict_GetItemString(args, "loops"), "loops") orelse return null,
+            .forever = compileSelectors(state, py.c.PyDict_GetItemString(args, "forever"), "forever") orelse return null,
+            .at_least_once = compileSelectors(state, py.c.PyDict_GetItemString(args, "at_least_once"), "at_least_once") orelse return null,
+            .exits = compileSelectors(state, py.c.PyDict_GetItemString(args, "exits"), "exits") orelse return null,
+            .breaks = compileSelectors(state, py.c.PyDict_GetItemString(args, "breaks"), "breaks") orelse return null,
+            .continues = compileSelectors(state, py.c.PyDict_GetItemString(args, "continues"), "continues") orelse return null,
+            .must_return = compileSelectors(state, py.c.PyDict_GetItemString(args, "must_return"), "must_return") orelse return null,
+            .variables = compileSelectors(state, py.c.PyDict_GetItemString(args, "variables"), "variables") orelse return null,
+            .assigns = compileSelectors(state, py.c.PyDict_GetItemString(args, "assigns"), "assigns") orelse return null,
+            .labels = labels,
+            .levels = .{
+                levelArg(args, "on_unreachable", .warning) orelse return null,
+                levelArg(args, "on_missing_return", .err) orelse return null,
+                unassigned,
+                unassigned,
+            },
+            .messages = messages,
+            .codes = codes,
+        };
+        if (fr.sequences.len == 0) {
+            raise(py.PyExc_ValueError(), "flow() needs `sequences`: the nodes whose children are statements run in order", .{});
+            return null;
+        }
+        if (fr.must_return.len != 0 and fr.functions.len == 0) {
+            raise(py.PyExc_ValueError(), "flow(must_return=...) needs `functions`", .{});
+            return null;
+        }
+        return fr;
+    }
+
     fn compileRule(state: *State, kind: Kind, args: *PyObject) ?CompiledRule {
+        if (kind == .flow) {
+            const compiled_flow = compileFlow(state, args) orelse return null;
+            return .{ .kind = kind, .message = "", .code = "", .severity = "error", .flow = compiled_flow };
+        }
         if (kind == .scopes) {
             const scope = compileScopes(state, args) orelse return null;
             return .{ .kind = kind, .message = "", .code = "", .severity = "error", .scope = scope };
@@ -1505,7 +1663,7 @@ const Rules = struct {
                 .unique => "duplicate '{text}'",
                 .require => "{rule} is incomplete",
                 .count => "wrong number of items ({count})",
-                .scopes, .custom, .types => "",
+                .scopes, .custom, .types, .flow => "",
             }) orelse return null,
             .code = textArg(state, args, "code", @tagName(kind)) orelse return null,
             .severity = textArg(state, args, "severity", "error") orelse return null,
@@ -1563,7 +1721,7 @@ const Rules = struct {
                 py.Py_IncRef(function);
                 compiled.callback = function;
             },
-            .forbid, .scopes, .types => {},
+            .forbid, .scopes, .types, .flow => {},
         }
         return compiled;
     }
@@ -1614,7 +1772,7 @@ const Rules = struct {
                     defer py.Py_DecRef(item);
                     const spec = Module.fromPy(*const Rule, item) catch {
                         py.c.PyErr_Clear();
-                        raise(py.PyExc_TypeError(), "rules[{d}] is not a spec (use inside(), unique(), forbid(), require(), count(), scopes() or custom())", .{i});
+                        raise(py.PyExc_TypeError(), "rules[{d}] is not a rule (use inside(), unique(), forbid(), require(), count(), scopes(), types(), flow() or custom())", .{i});
                         return null;
                     };
                     const compiled = compileRule(state, @enumFromInt(spec._kind), spec._args orelse return null) orelse return null;
@@ -1650,6 +1808,19 @@ const Rules = struct {
             @memcpy(extended[0..sr.builtins.len], sr.builtins);
             @memcpy(extended[sr.builtins.len..], tr.basic);
             sr.builtins = extended;
+        }
+
+        // A flow() rule that follows variables reads them from a scopes() rule
+        for (state.rules.items) |r| {
+            const fr = r.flow orelse continue;
+            if (fr.variables.len == 0 and fr.assigns.len == 0) continue;
+            const found = for (state.rules.items) |other| {
+                const sr = other.scope orelse continue;
+                if (fr.namespace.len == 0 or std.mem.eql(u8, sr.namespace, fr.namespace)) break true;
+            } else false;
+            if (found) continue;
+            if (fr.namespace.len == 0) raise(py.PyExc_ValueError(), "flow(variables=..., assigns=...) needs a scopes() rule in the same Rules: it follows the names that rule resolves", .{}) else raise(py.PyExc_ValueError(), "flow(namespace='{s}'): no scopes() rule has that namespace", .{fr.namespace});
+            return null;
         }
 
         ok = true;
@@ -2053,6 +2224,50 @@ const Rules = struct {
             };
         }
 
+        /// Run a flow() rule over this file and report what it finds.
+        fn runFlow(self: *Run, fr: *const FlowRule) !void {
+            var inputs = flow_mod.Inputs{
+                .labels = fr.labels,
+                .sequences = try self.matchAll(fr.sequences),
+                .functions = try self.matchAll(fr.functions),
+                .branches = try self.matchAll(fr.branches),
+                .arms = try self.matchAll(fr.arms),
+                .otherwise = try self.matchAll(fr.otherwise),
+                .loops = try self.matchAll(fr.loops),
+                .forever = try self.matchAll(fr.forever),
+                .at_least_once = try self.matchAll(fr.at_least_once),
+                .exits = try self.matchAll(fr.exits),
+                .breaks = try self.matchAll(fr.breaks),
+                .continues = try self.matchAll(fr.continues),
+                .must_return = try self.matchAll(fr.must_return),
+                .variables = try self.matchAll(fr.variables),
+                .assigns = try self.matchAll(fr.assigns),
+            };
+            // The scopes() rule whose names it follows
+            for (self.scope_results.items, 0..) |*result, r| {
+                if (fr.namespace.len != 0 and !std.mem.eql(u8, result.namespace, fr.namespace)) continue;
+                inputs.names = &result.result;
+                inputs.uses = self.scope_inputs.items[r].uses;
+                inputs.definitions = self.scope_inputs.items[r].defs;
+                inputs.members = self.scope_inputs.items[r].members;
+                break;
+            }
+            var analysis = flow_mod.Analysis{ .arena = self.arena, .tree = self.tree, .in = inputs };
+            try analysis.run();
+            for (analysis.problems.items) |p| {
+                const k = @intFromEnum(p.kind);
+                if (fr.levels[k] == .ignore) continue;
+                const flat = self.tree.nodes[p.node];
+                try self.add(.{
+                    .start = flat.text_start,
+                    .end = flat.text_end,
+                    .severity = if (fr.levels[k] == .err) "error" else "warning",
+                    .code = fr.codes[k],
+                    .message = try format(self.arena, fr.messages[k], self.values(p.node)),
+                });
+            }
+        }
+
         /// The child of `node` labelled `field`, or NONE (field 0 never matches).
         fn childLabelled(self: *const Run, node: u32, field: u8) u32 {
             if (field == 0) return NONE;
@@ -2344,7 +2559,7 @@ const Rules = struct {
         fn check(self: *Run, rule_idx: usize) !void {
             const cr = &self.state.rules.items[rule_idx];
             // Custom rules run afterwards, from Python; types once the names are resolved
-            if (cr.kind == .custom or cr.kind == .types) return;
+            if (cr.kind == .custom or cr.kind == .types or cr.kind == .flow) return;
             if (cr.scope) |sr| return self.prepareScopes(sr);
             const t = self.tree;
             var chain_buf: [selector.MAX_COMPOUNDS]u32 = undefined;
@@ -2462,7 +2677,7 @@ const Rules = struct {
                         }
                     }
                 },
-                .scopes, .custom, .types => unreachable,
+                .scopes, .custom, .types, .flow => unreachable,
             }
         }
     };
@@ -2692,8 +2907,13 @@ const Rules = struct {
             }
         }
 
-        // Types, once every file's names are resolved
+        // Types and flow, once every file's names are resolved
         if (!runTypes(state, files)) return false;
+        for (files) |f| {
+            for (state.rules.items) |r| {
+                if (r.flow) |fr| f.run.runFlow(fr) catch return oomObject() != null;
+            }
+        }
 
         // Pass 3: the parts that call into Python, and the diagnostics
         var key_share: ?*KeyShare = null;
@@ -2958,6 +3178,7 @@ pub const Module = pyoz.module(.{
         pyoz.func("scopes", scopes, "scopes(scope, define, use, define_outer=None, hoist=None, after=None, builtins=None, ordered=True, namespace='name', on_undefined='error', on_redefine='error', on_unused='ignore', on_shadow='ignore', on_no_member='error', members=None, member_labels=('target', 'name'), imports=None, import_all=None, import_labels=('module', 'names', 'alias'), exports=None, on_no_module='error', on_no_export='error', on_unresolved=None, messages=None, codes=None): resolve names. `scope` nodes open a scope; `define` nodes define their text as a name in the scope around them (`define_outer`: in the scope outside that one); `use` nodes must resolve to a definition. `hoist` definitions are visible before their position; `after` definitions only once their parent node has ended. `members` nodes are accesses like a.b: the child labelled name is looked up in the scope that the child labelled target names."),
         pyoz.func("custom", custom, "custom(selector, function, code=None): call function(node, ctx) for every node matching `selector`."),
         pyoz.func("types", types, "types(basic=None, coerce=None, literals=None, containers=None, names=None, type_names=None, type_args=None, optional=None, variables=None, functions=None, structs=None, binary=None, unary=None, calls=None, index=None, assigns=None, returns=None, conditions=None, operators=None, builtins=None, labels=None, namespace=None, severity='error', codes=None, ignore=None): type-check the program. Each option names the nodes that play a role (selectors), read through labelled children; see the documentation. Needs a scopes() rule for the names."),
+        pyoz.func("flow", flow, "flow(sequences, functions=None, branches=None, arms=None, otherwise=None, loops=None, forever=None, at_least_once=None, exits=None, breaks=None, continues=None, must_return=None, variables=None, assigns=None, labels=None, namespace=None, on_unreachable='warning', on_missing_return='error', on_unassigned='error', messages=None, codes=None): follow the control flow. Reports code that can't be reached, `must_return` functions whose end can be, and variables (declared by `variables` without a value, or defined by `assigns`) used before they have a value on every path."),
         pyoz.func("version", version, "Return the zrules version string"),
     },
     .classes = &.{

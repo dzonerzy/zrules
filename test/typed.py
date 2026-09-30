@@ -5,7 +5,7 @@ from zrules import Rules, scopes, types
 
 GRAMMAR = r"""
 program    = ws (stmt ws)*
-@silent stmt = import_stmt | from_stmt | struct_def | funcdef | if_stmt | while_stmt | return_stmt | let_stmt | assign | expr_stmt
+@silent stmt = import_stmt | from_stmt | struct_def | funcdef | if_stmt | while_stmt | loop_stmt | do_stmt | return_stmt | break_stmt | continue_stmt | let_stmt | assign | expr_stmt
 import_stmt = 'import' kw ws module:ident ws ';'
 from_stmt   = 'from' kw ws module:ident ws 'import' kw ws names:ident (ws ',' ws names:ident)* ws ';'
 struct_def = 'struct' kw ws name:ident ws '{' ws (field ws)* (funcdef ws)* '}'
@@ -13,8 +13,12 @@ field      = name:ident ws ':' ws type:type_expr ws ';'
 funcdef    = 'fn' kw ws name:ident ws '(' ws (params:param (ws ',' ws params:param)*)? ws ')' (ws '->' ws returns:type_expr)? ws block
 param      = name:ident (ws ':' ws type:type_expr)?
 block      = '{' ws (stmt ws)* '}'
-if_stmt    = 'if' kw ws cond:expr ws block (ws 'else' kw ws block)?
+if_stmt    = 'if' kw ws cond:expr ws block (ws 'else' kw ws (if_stmt | block))?
 while_stmt = 'while' kw ws cond:expr ws block
+loop_stmt  = 'loop' kw ws block
+do_stmt    = 'do' kw ws block ws 'while' kw ws cond:expr ws ';'
+break_stmt = 'break' kw ws ';'
+continue_stmt = 'continue' kw ws ';'
 return_stmt = 'return' kw (ws value:expr)? ws ';'
 let_stmt   = 'let' kw ws name:ident (ws ':' ws type:type_expr)? (ws '=' ws value:expr)? ws ';'
 assign     = target:postfix ws '=' !'=' ws value:expr ws ';'
@@ -48,7 +52,7 @@ ident      = !keyword [a-zA-Z_] [a-zA-Z0-9_]*
 cmpop      = '==' | '!=' | '<=' | '>=' | '<' | '>'
 addop      = [+\-]
 mulop      = [*/%]
-@silent keyword = ('import' | 'from' | 'struct' | 'fn' | 'if' | 'else' | 'while' | 'return' | 'let' | 'not' | 'true' | 'false' | 'nil') kw
+@silent keyword = ('import' | 'from' | 'struct' | 'fn' | 'if' | 'else' | 'while' | 'loop' | 'do' | 'break' | 'continue' | 'return' | 'let' | 'not' | 'true' | 'false' | 'nil') kw
 @silent kw = ![a-zA-Z0-9_]
 @silent ws = ([ \t\n] | '#' [^\n]*)*
 """
@@ -87,7 +91,7 @@ TYPES = dict(
     index="index_op",
     assigns="assign",
     returns="return_stmt",
-    conditions="if_stmt > .cond, while_stmt > .cond",
+    conditions="if_stmt > .cond, while_stmt > .cond, do_stmt > .cond",
     operators={
         "+": NUMERIC + [("str", "str", "str")],
         "-": NUMERIC + [("int", "int"), ("float", "float")],
@@ -103,6 +107,23 @@ TYPES = dict(
         "not": [("bool", "bool")],
     },
     builtins={"print": "fn(...) -> void", "len": "fn(any) -> int"},
+)
+
+
+FLOW = dict(
+    sequences="program, block",
+    functions="funcdef",
+    branches="if_stmt",
+    otherwise="if_stmt > block + block",
+    loops="while_stmt",
+    forever="loop_stmt",
+    at_least_once="do_stmt",
+    exits="return_stmt",
+    breaks="break_stmt",
+    continues="continue_stmt",
+    must_return="funcdef:has(> .returns):not([returns=void])",
+    variables="let_stmt",
+    assigns="assign",
 )
 
 

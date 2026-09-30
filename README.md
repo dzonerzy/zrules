@@ -4,7 +4,7 @@
 
 zgram tells you whether a text is well-formed. zrules tells you whether it is *valid*: `break` only inside a loop, no duplicate parameters, `len()` takes one argument. You write each check as one line; zrules runs them natively over zgram's parse tree and reports every violation as a `zgram.Diagnostic`.
 
-It covers four levels of checking: one-line structural rules, name resolution with scopes (which also gives you a symbol table, within a file or across a project), type checking, and custom rules written as Python functions. Part of zsuite (zgram, zrules, zrun, zlsp).
+It covers five levels of checking: one-line structural rules, name resolution with scopes (which also gives you a symbol table, within a file or across a project), type checking, control flow (unreachable code, missing returns, variables used before they have a value), and custom rules written as Python functions. Part of zsuite (zgram, zrules, zrun, zlsp).
 
 ```python
 import zgram
@@ -267,6 +267,40 @@ Custom rules get the same through `ctx.type_of(node)`. With `analyze_project()`,
 
 The checker has no recursion limit to run into: a chain of thousands of definitions each depending on the next, within a file or across files, is typed without deep recursion.
 
+## Control flow
+
+`flow()` follows the paths a program can take. It reports code that can't be reached, functions that may end without returning, and variables used before they have a value.
+
+```python
+flow(
+    sequences="Program, Block",            # nodes whose children run one after the other
+    functions="FuncDef",                   # a flow of its own, not run where it is written
+    branches="If",                         # runs one of its arms
+    otherwise="If > .else",                # the arm that runs when no other does
+    loops="While",                         # the body may run any number of times
+    forever="Loop",                        # ends only through a break
+    at_least_once="DoWhile",               # the body runs before the condition
+    exits="Return, Throw",                 # nothing runs after these
+    breaks="Break",
+    continues="Continue",
+    must_return="FuncDef:has(> .returns)", # functions whose end must not be reachable
+    variables="Let",                       # declarations: children `name`, `value`
+    assigns="Assign",                      # assignments: child `target`
+)
+```
+
+Only `sequences` is required; every other option adds to what is understood.
+
+- **Unreachable code** (`unreachable`, a warning by default): the first statement of a sequence that no path gets to, after a `return` or `break`, after a branch whose arms all leave, after a loop that never ends. It is reported once per sequence. A function written after a `return` is not dead code: it is a definition.
+- **Missing return** (`missing-return`): a `must_return` function whose end some path reaches. It is reported on the function's `name` child.
+- **Used before it has a value** (`unassigned`): a variable that is declared without a value (a `variables` node with no `value` child), or defined by an assignment (the `target` of an `assigns` node is its definition, as in languages without declarations), is followed from the start of its function. A use on a path where it has no value yet is an error, worded "is used" when no path gives it one and "may be used" when only some do. A variable is reported once. This part reads the names a `scopes()` rule resolved.
+- **Branches.** The arms of a branch are its child sequences, or what `arms=` selects; everything else in it (the condition) always runs. A branch covers every case only if one of its arms is an `otherwise` arm, or a nested branch (`else if`). Without one, the path that takes no arm counts too.
+- **Loops.** The body of a loop is its first child sequence; what comes before it (the condition) runs at least once, what comes after it (the step of a `for`, the condition of a `do ... while`) after each iteration. What a loop body gives a value to may not have one after the loop, unless the loop is `at_least_once`.
+- **Functions** are separate: a use inside a nested function of a variable of the enclosing one is not judged (when the nested function runs is not known), and a variable that another function assigns is not followed at all.
+- **`exits`** can be any node, not just a statement: `exits="Return, Call[callee=exit]"` makes a call of `exit()` end the path.
+
+`labels={"target": "lhs"}` renames the children read (`name`, `value`, `target`); `on_unreachable`, `on_missing_return` and `on_unassigned` are `"error"`, `"warning"` or `"ignore"`; `messages=` and `codes=` take the keys `unreachable`, `missing_return`, `unassigned` and `maybe_unassigned`. Control structures nested more than 256 deep are not looked into.
+
 ## Custom rules
 
 Anything the declarative rules don't cover is a Python function, called for every node matching a selector:
@@ -318,6 +352,7 @@ Each rule visits only the nodes its selector can end on, found through an index 
 | 19 structural rules | 0.9 ms |
 | `scopes()` resolving 8,000 definitions and 16,000 uses (34,000 nodes) | 1.3 ms |
 | `scopes()` + `types()` on a typed program: 896 KB, 260,000 nodes, 20,000 typed declarations with calls | 31 ms |
+| the same kind of program with `flow()` added (773 KB, 265,000 nodes) | 39 ms, 4.5 ms of it flow |
 | `analyze_project()` on 8,000 small files importing one another, with types | 80 ms |
 
 `Symbol` objects are created only when asked for (`symbols`, `resolve()`, `at()`), so `check()` pays nothing for them.

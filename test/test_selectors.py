@@ -171,3 +171,58 @@ class TestPseudoClasses:
         with pytest.raises(ValueError, match="malformed"):
             Rules(parser, [forbid(" > ".join(["block"] * 17))])
         Rules(parser, [forbid(" > ".join(["block"] * 16))])
+
+
+class TestSiblings:
+    SRC = "let a = 1; f(a); let b = 2; break; g(b); h(b);"
+
+    def test_next_sibling(self, parser):
+        assert texts(parser, "let_stmt + call", self.SRC) == ["f(a)"]
+        assert texts(parser, "break_stmt + call", self.SRC) == ["g(b)"]
+        assert texts(parser, "call + call", self.SRC) == ["h(b)"]
+
+    def test_later_sibling(self, parser):
+        assert texts(parser, "break_stmt ~ call", self.SRC) == ["g(b)", "h(b)"]
+        assert texts(parser, "let_stmt ~ break_stmt", self.SRC) == ["break;"]
+        assert texts(parser, "break_stmt ~ let_stmt", self.SRC) == []
+
+    def test_siblings_share_a_parent(self, parser):
+        src = "fn f() { break; } g();"
+        assert texts(parser, "break_stmt ~ call", src) == []
+        assert texts(parser, "funcdef + call", src) == ["g()"]
+
+    def test_mixed_with_other_combinators(self, parser):
+        src = "fn f() { let a = 1; return a; } fn g() { return 1; }"
+        assert texts(parser, "funcdef > block > let_stmt + return_stmt", src) == ["return a;"]
+        assert texts(parser, "funcdef + funcdef return_stmt", src) == ["return 1;"]
+
+    def test_first_node_has_no_siblings_before_it(self, parser):
+        assert texts(parser, "* + let_stmt", "let a = 1;") == []
+
+    @pytest.mark.parametrize("selector", ["+ call", "call +", "call + + call", "call ~"])
+    def test_malformed(self, parser, selector):
+        with pytest.raises(ValueError):
+            Rules(parser, [forbid(selector)])
+
+
+class TestLists:
+    SRC = "break; return 1; f();"
+
+    def test_comma(self, parser):
+        assert texts(parser, "break_stmt, return_stmt", self.SRC) == ["break;", "return 1;"]
+        assert texts(parser, "return_stmt,break_stmt , call", self.SRC) == ["break;", "return 1;", "f()"]
+
+    def test_sequence(self, parser):
+        assert [f[3] for f in found(Rules(parser, [forbid(("break_stmt", "call"))]), self.SRC)] == ["break;", "f()"]
+        assert [f[3] for f in found(Rules(parser, [forbid(["break_stmt, call", "return_stmt"])]), self.SRC)] == ["break;", "return 1;", "f()"]
+
+    def test_a_node_matched_twice_is_reported_once(self, parser):
+        assert texts(parser, "break_stmt, Break, *.body:not(call):not(return_stmt)", self.SRC) == ["break;"]
+
+    def test_commas_inside_brackets_and_parentheses(self, parser):
+        assert texts(parser, "call[name=f], call:not([name=g])", "f(); g(1); h();") == ["f()", "h()"]
+
+    @pytest.mark.parametrize("selector", ["break_stmt,", ",break_stmt", "break_stmt,,call", ()])
+    def test_empty_alternative(self, parser, selector):
+        with pytest.raises(ValueError, match="empty"):
+            Rules(parser, [forbid(selector)])

@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Selectors** over zgram parse trees: rule and class names, `*`, `.label`, `name.label`, `[label=text]`, child (`>`) and descendant combinators.
 - **Rules:** `inside`, `unique`, `forbid`, `require` and `count`, each with `message`, `code` and `severity`.
 - **Selector pseudo-classes:** `:not(...)`, `:has(...)`, `:nth(n)`, `:first`, `:last`.
+- **Sibling selectors** `a + b` and `a ~ b`, and **selector lists** (`a, b` or a sequence) wherever a selector is accepted.
+- **`within=`** for `unique` and `count`: group by the nearest matching ancestor.
+- **Message placeholders** `{field}`, `{parent}`, `{min}` and `{max}`.
+- **`on_unresolved=`** for `scopes()`: a function that decides about names that resolve to nothing.
 - **`scopes()`:** name resolution with nested scopes, outer definitions, hoisting, builtins, separate namespaces, and diagnostics for undefined, redefined, unused and shadowed names.
 - **`rules.analyze()`** returns an `Analysis` with the diagnostics and the symbol table: `symbols`, `resolve(node)`, `at(offset)`.
 - **Custom rules:** `@rules.rule(selector)`, `rules.add()` and `custom()` call a Python function with the node and a context (`error`, `warning`, `note`, `resolve`).

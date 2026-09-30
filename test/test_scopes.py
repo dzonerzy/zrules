@@ -240,3 +240,57 @@ class TestSymbols:
         assert len(analysis.symbols) == 3000
         assert [d.message for d in analysis.diagnostics] == ["undefined name 'nope'"]
         assert all(len(s.uses) == 1 for s in analysis.symbols)
+
+
+class TestUnresolved:
+    def test_hook_decides(self, parser):
+        asked = []
+
+        def known(node, ctx):
+            asked.append((node.text(), type(ctx).__name__))
+            return node.text().startswith("ext")
+
+        rules = make(parser, on_unresolved=known)
+        assert found(rules, "let a = 1; ext_x; nope; a; extra(a);") == [("undefined-name", 1, 19, "nope")]
+        assert asked == [("ext_x", "Context"), ("nope", "Context"), ("extra", "Context")]
+
+    def test_hook_can_report_its_own_diagnostic(self, parser):
+        def suggest(node, ctx):
+            ctx.error(node, f"unknown name '{node.text()}': did you mean 'alpha'?")
+            return True
+
+        rules = make(parser, on_unresolved=suggest)
+        (d,) = rules.check("let alpha = 1; alpa;")
+        assert (d.code, d.message) == ("undefined-name", "unknown name 'alpa': did you mean 'alpha'?")
+
+    def test_hook_sees_the_symbols(self, parser):
+        def close_match(node, ctx):
+            return any(s.name.startswith(node.text()) for s in ctx.symbols)
+
+        rules = make(parser, on_unresolved=close_match)
+        assert [f[3] for f in found(rules, "let alpha = 1; alp; zz;")] == ["zz"]
+
+    def test_hook_exception_propagates(self, parser):
+        def boom(node, ctx):
+            raise LookupError(node.text())
+
+        with pytest.raises(LookupError, match="zz"):
+            make(parser, on_unresolved=boom).check("zz;")
+
+    def test_not_callable(self, parser):
+        with pytest.raises(TypeError, match="callable"):
+            make(parser, on_unresolved=5)
+
+    def test_released_with_the_rules(self, parser):
+        import gc
+        import sys
+
+        def hook(node, ctx):
+            return True
+
+        before = sys.getrefcount(hook)
+        rules = make(parser, on_unresolved=hook)
+        rules.check("zz;")
+        del rules
+        gc.collect()
+        assert sys.getrefcount(hook) == before

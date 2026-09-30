@@ -195,3 +195,63 @@ class TestRules:
         src = "while x { break; }\n" * 5000 + "break;\n"
         ds = rules.check(src)
         assert [(d.line, d.column) for d in ds] == [(5001, 1)]
+
+
+class TestWithin:
+    def test_unique_within(self, parser):
+        # without `within`, a one-part selector is unique over the whole tree
+        src = "fn f(a) { let x = 1; let x = 2; } fn g(a) { let x = 3; }"
+        whole = Rules(parser, [unique("Name.name")])
+        assert [f[2] for f in found(whole, src)] == [26, 49]
+        # a two-part selector groups by its first part: each Let is its own group
+        assert found(Rules(parser, [unique("Let > .name")]), src) == []
+        per_function = Rules(parser, [unique("Let > .name, .params", within="FuncDef")])
+        assert found(per_function, src) == [("unique", 1, 26, "x")]
+
+    def test_unique_within_spans_alternatives(self, parser):
+        rules = Rules(parser, [unique("Let > .name, .params", within="FuncDef", message="'{text}' again")])
+        (d,) = rules.check("fn f(a) { let a = 1; }")
+        assert (d.message, d.column, d.notes[0].span) == ("'a' again", 15, (5, 6))
+
+    def test_unique_outside_any_group(self, parser):
+        rules = Rules(parser, [unique("Let > .name", within="FuncDef")])
+        assert [f[2] for f in found(rules, "let a = 1; let a = 2; fn f() { let a = 3; }")] == [16]
+
+    def test_count_within(self, parser):
+        rules = Rules(parser, [count("Return", within="FuncDef", max=1, message="{count} returns, at most {max}")])
+        ds = rules.check("fn f() { return 1; } fn g() { while x { return 1; } return 2; } fn h() {}")
+        assert [(d.message, d.column) for d in ds] == [("2 returns, at most 1", 22)]
+
+    def test_count_within_reports_empty_groups(self, parser):
+        rules = Rules(parser, [count("Return", within="FuncDef", min=1)])
+        assert [f[2] for f in found(rules, "fn f() { return 1; } fn h() {}")] == [22]
+
+    def test_count_nearest_group(self, parser):
+        rules = Rules(parser, [count("Break", within="While", max=1)])
+        assert found(rules, "while a { break; while b { break; } }") == []
+
+
+class TestPlaceholders:
+    def test_all(self, parser):
+        rules = Rules(parser, [count("FuncDef > .params", min=1, max=2, message="{rule} [{field}] in {parent}: {count} not in {min}..{max}: {text}")])
+        (d,) = rules.check("fn f() {}")
+        assert d.message == "funcdef [body] in program: 0 not in 1..2: fn f() {}"
+
+    def test_unbounded_and_unknown(self, parser):
+        rules = Rules(parser, [count("FuncDef > .params", min=1, message="{min}..{max} {nope} {")])
+        assert rules.check("fn f() {}")[0].message == "1..any number {nope} {"
+
+    def test_root_and_unlabelled(self, parser):
+        rules = Rules(parser, [forbid("program", message="[{field}] [{parent}]")])
+        assert rules.check("")[0].message == "[] []"
+
+
+class TestRequireAlternatives:
+    def test_each_alternative_is_checked(self, parser):
+        rules = Rules(parser, [require("FuncDef > .params, While Break", message="{rule} incomplete")])
+        ds = rules.check("fn f() { while x { } } fn g(a) { while y { break; } }")
+        assert [(d.message, d.column) for d in ds] == [("funcdef incomplete", 1), ("while_stmt incomplete", 10)]
+
+    def test_following_sibling(self, parser):
+        rules = Rules(parser, [require("Let + *", message="'{text}' is the last statement")])
+        assert [d.message for d in rules.check("let a = 1; f(); let b = 2;")] == ["'let b = 2;' is the last statement"]

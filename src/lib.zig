@@ -115,9 +115,15 @@ fn inside(args: pyoz.Args(struct {
     }) };
 }
 
-fn unique(args: pyoz.Args(Common)) pyoz.Signature(?Rule, "Rule") {
+fn unique(args: pyoz.Args(struct {
+    selector: *PyObject,
+    within: ?*PyObject = null,
+    message: ?*PyObject = null,
+    code: ?*PyObject = null,
+    severity: ?*PyObject = null,
+})) pyoz.Signature(?Rule, "Rule") {
     const a = args.value;
-    return .{ .value = makeRule(.unique, .{ .{ "selector", a.selector }, .{ "message", a.message }, .{ "code", a.code }, .{ "severity", a.severity } }) };
+    return .{ .value = makeRule(.unique, .{ .{ "selector", a.selector }, .{ "within", a.within }, .{ "message", a.message }, .{ "code", a.code }, .{ "severity", a.severity } }) };
 }
 
 fn forbid(args: pyoz.Args(Common)) pyoz.Signature(?Rule, "Rule") {
@@ -135,6 +141,7 @@ fn count(args: pyoz.Args(struct {
     exactly: ?*PyObject = null,
     min: ?*PyObject = null,
     max: ?*PyObject = null,
+    within: ?*PyObject = null,
     message: ?*PyObject = null,
     code: ?*PyObject = null,
     severity: ?*PyObject = null,
@@ -142,7 +149,7 @@ fn count(args: pyoz.Args(struct {
     const a = args.value;
     return .{ .value = makeRule(.count, .{
         .{ "selector", a.selector }, .{ "exactly", a.exactly }, .{ "min", a.min },           .{ "max", a.max },
-        .{ "message", a.message },   .{ "code", a.code },       .{ "severity", a.severity },
+        .{ "message", a.message },   .{ "code", a.code },       .{ "severity", a.severity }, .{ "within", a.within },
     }) };
 }
 
@@ -160,6 +167,7 @@ fn scopes(args: pyoz.Args(struct {
     on_redefine: ?*PyObject = null,
     on_unused: ?*PyObject = null,
     on_shadow: ?*PyObject = null,
+    on_unresolved: ?*PyObject = null,
     messages: ?*PyObject = null,
     codes: ?*PyObject = null,
 })) pyoz.Signature(?Rule, "Rule") {
@@ -170,6 +178,7 @@ fn scopes(args: pyoz.Args(struct {
         .{ "ordered", a.ordered },           .{ "namespace", a.namespace },     .{ "on_undefined", a.on_undefined },
         .{ "on_redefine", a.on_redefine },   .{ "on_unused", a.on_unused },     .{ "on_shadow", a.on_shadow },
         .{ "messages", a.messages },         .{ "codes", a.codes },             .{ "after", a.after },
+        .{ "on_unresolved", a.on_unresolved },
     }) };
 }
 
@@ -205,13 +214,19 @@ const ScopeRule = struct {
     levels: [4]Level,
     messages: [4][]const u8,
     codes: [4][]const u8,
+    /// Called with (node, ctx) for a use that resolves to nothing; a true
+    /// result means the language knows the name after all. A strong reference.
+    on_unresolved: ?*PyObject = null,
 };
 
 const CompiledRule = struct {
     kind: Kind,
-    selector: Selector,
-    /// inside: ancestors that satisfy the rule, and ancestors that end the search
+    /// The alternatives of the rule's selector (`a, b` or a sequence)
+    selectors: []const Selector = &.{},
+    /// inside: ancestors that satisfy the rule. unique, count: the ancestors
+    /// that delimit a group (default: what the selector's first part matched)
     within: []const Selector = &.{},
+    /// inside: ancestors that end the search
     stop_at: []const Selector = &.{},
     /// count: allowed range
     min: u32 = 0,
@@ -698,11 +713,11 @@ const Rules = struct {
         return null;
     }
 
-    /// Compile one selector, raising ValueError with the selector's text on failure.
-    fn compileSelector(state: *State, obj: *PyObject, what: []const u8) ?Selector {
-        const text = utf8(obj, what) orelse return null;
+    /// Compile a selector list (`a, b`), raising ValueError with its text on failure.
+    fn compileText(state: *State, obj: *PyObject, what: []const u8, out: *std.ArrayList(Selector)) bool {
+        const text = utf8(obj, what) orelse return false;
         var bad: []const u8 = "";
-        return selector.compile(state.arena.allocator(), state.names, text, &bad) catch |e| {
+        const list = selector.compileList(state.arena.allocator(), state.names, text, &bad) catch |e| {
             switch (e) {
                 error.UnknownName => raise(py.PyExc_ValueError(), "selector '{s}': the grammar has no rule or class '{s}'", .{ text, bad }),
                 error.UnknownField => raise(py.PyExc_ValueError(), "selector '{s}': the grammar has no label '{s}'", .{ text, bad }),
@@ -710,21 +725,23 @@ const Rules = struct {
                 error.BadSelector => raise(py.PyExc_ValueError(), "selector '{s}' is malformed", .{text}),
                 error.OutOfMemory => _ = py.c.PyErr_NoMemory(),
             }
-            return null;
+            return false;
         };
+        out.appendSlice(state.arena.allocator(), list) catch {
+            _ = py.c.PyErr_NoMemory();
+            return false;
+        };
+        return true;
     }
 
-    /// One selector (a str) or several (a sequence of str); none when absent.
+    /// Selectors from a str (one, or several separated by commas) or a
+    /// sequence of such str; none when absent.
     fn compileSelectors(state: *State, obj: ?*PyObject, what: []const u8) ?[]const Selector {
         const o = obj orelse return &.{};
-        const arena = state.arena.allocator();
+        var out: std.ArrayList(Selector) = .empty;
         if (py.PyUnicode_Check(o)) {
-            const one = arena.alloc(Selector, 1) catch {
-                _ = py.c.PyErr_NoMemory();
-                return null;
-            };
-            one[0] = compileSelector(state, o, what) orelse return null;
-            return one;
+            if (!compileText(state, o, what, &out)) return null;
+            return out.items;
         }
         const n = py.c.PySequence_Size(o);
         if (n < 0) {
@@ -732,16 +749,12 @@ const Rules = struct {
             raise(py.PyExc_TypeError(), "{s} must be a str or a sequence of str", .{what});
             return null;
         }
-        const out = arena.alloc(Selector, @intCast(n)) catch {
-            _ = py.c.PyErr_NoMemory();
-            return null;
-        };
-        for (out, 0..) |*slot, i| {
+        for (0..@intCast(n)) |i| {
             const item = py.c.PySequence_GetItem(o, @intCast(i)) orelse return null;
             defer py.Py_DecRef(item);
-            slot.* = compileSelector(state, item, what) orelse return null;
+            if (!compileText(state, item, what, &out)) return null;
         }
-        return out;
+        return out.items;
     }
 
     /// A str argument copied into the arena, or `default` when absent.
@@ -840,13 +853,21 @@ const Rules = struct {
             }) orelse return null,
             .codes = problemTexts(state, args, "codes", .{ "undefined-name", "redefined-name", "unused-name", "shadowed-name" }) orelse return null,
         };
+        if (py.c.PyDict_GetItemString(args, "on_unresolved")) |f| {
+            if (py.c.PyCallable_Check(f) == 0) {
+                raise(py.PyExc_TypeError(), "on_unresolved must be callable: on_unresolved(node, ctx)", .{});
+                return null;
+            }
+            py.Py_IncRef(f);
+            sr.on_unresolved = f;
+        }
         return sr;
     }
 
     fn compileRule(state: *State, kind: Kind, args: *PyObject) ?CompiledRule {
         if (kind == .scopes) {
             const scope = compileScopes(state, args) orelse return null;
-            return .{ .kind = kind, .selector = .{ .compounds = &.{}, .source = "" }, .message = "", .code = "", .severity = "error", .scope = scope };
+            return .{ .kind = kind, .message = "", .code = "", .severity = "error", .scope = scope };
         }
         const sel_obj = py.c.PyDict_GetItemString(args, "selector") orelse {
             raise(py.PyExc_ValueError(), "rule has no selector", .{});
@@ -854,7 +875,7 @@ const Rules = struct {
         };
         var compiled = CompiledRule{
             .kind = kind,
-            .selector = compileSelector(state, sel_obj, "selector") orelse return null,
+            .selectors = compileSelectors(state, sel_obj, "selector") orelse return null,
             .message = textArg(state, args, "message", switch (kind) {
                 .inside, .forbid => "{rule} is not allowed here",
                 .unique => "duplicate '{text}'",
@@ -869,6 +890,10 @@ const Rules = struct {
             raise(py.PyExc_ValueError(), "severity must be 'error', 'warning' or 'note'", .{});
             return null;
         }
+        if (compiled.selectors.len == 0) {
+            raise(py.PyExc_ValueError(), "selector is empty", .{});
+            return null;
+        }
         switch (kind) {
             .inside => {
                 compiled.within = compileSelectors(state, py.c.PyDict_GetItemString(args, "within"), "within") orelse return null;
@@ -878,11 +903,14 @@ const Rules = struct {
                     return null;
                 }
             },
-            .require => if (compiled.selector.compounds.len < 2) {
-                raise(py.PyExc_ValueError(), "require('{s}'): the selector needs a parent and the required part, as in 'funcdef > block'", .{compiled.selector.source});
+            .require => for (compiled.selectors) |sel| {
+                if (sel.compounds.len >= 2) continue;
+                raise(py.PyExc_ValueError(), "require('{s}'): the selector needs a parent and the required part, as in 'funcdef > block'", .{sel.source});
                 return null;
             },
+            .unique => compiled.within = compileSelectors(state, py.c.PyDict_GetItemString(args, "within"), "within") orelse return null,
             .count => {
+                compiled.within = compileSelectors(state, py.c.PyDict_GetItemString(args, "within"), "within") orelse return null;
                 var failed = false;
                 const exactly = intArg(args, "exactly", &failed);
                 const lo = intArg(args, "min", &failed);
@@ -911,7 +939,7 @@ const Rules = struct {
                 py.Py_IncRef(function);
                 compiled.callback = function;
             },
-            .unique, .forbid, .scopes => {},
+            .forbid, .scopes => {},
         }
         return compiled;
     }
@@ -919,6 +947,9 @@ const Rules = struct {
     fn destroyState(state: *State) void {
         for (state.rules.items) |r| {
             if (r.callback) |f| py.Py_DecRef(f);
+            if (r.scope) |sr| {
+                if (sr.on_unresolved) |f| py.Py_DecRef(f);
+            }
         }
         state.arena.deinit();
         allocator.destroy(state);
@@ -1037,26 +1068,47 @@ const Rules = struct {
 
     // ── Checking ──
 
-    /// Expand {text}, {rule} and {count} in a message template.
-    fn format(arena: std.mem.Allocator, template: []const u8, text: []const u8, rule_name: []const u8, n: u32) ![]const u8 {
+    /// What a message template can mention
+    const Values = struct {
+        /// {text}: the flagged node's text; {rule}: its rule name
+        text: []const u8 = "",
+        rule: []const u8 = "",
+        /// {field}: its label ("" without one); {parent}: its parent's rule name
+        field: []const u8 = "",
+        parent: []const u8 = "",
+        /// {count}, and the {min} / {max} it was checked against
+        count: u32 = 0,
+        min: u32 = 0,
+        max: u32 = std.math.maxInt(u32),
+    };
+
+    /// Expand the placeholders of a message template; anything else in
+    /// braces is left as written.
+    fn format(arena: std.mem.Allocator, template: []const u8, v: Values) ![]const u8 {
         var out: std.ArrayList(u8) = .empty;
         var i: usize = 0;
-        while (i < template.len) {
-            const rest = template[i..];
-            if (std.mem.startsWith(u8, rest, "{text}")) {
-                try out.appendSlice(arena, text);
-                i += 6;
-            } else if (std.mem.startsWith(u8, rest, "{rule}")) {
-                try out.appendSlice(arena, rule_name);
-                i += 6;
-            } else if (std.mem.startsWith(u8, rest, "{count}")) {
-                var buf: [16]u8 = undefined;
-                try out.appendSlice(arena, std.fmt.bufPrint(&buf, "{d}", .{n}) catch unreachable);
-                i += 7;
-            } else {
-                try out.append(arena, template[i]);
-                i += 1;
+        outer: while (i < template.len) {
+            if (template[i] == '{') {
+                const rest = template[i..];
+                inline for (.{ "text", "rule", "field", "parent" }) |name| {
+                    if (std.mem.startsWith(u8, rest, "{" ++ name ++ "}")) {
+                        try out.appendSlice(arena, @field(v, name));
+                        i += name.len + 2;
+                        continue :outer;
+                    }
+                }
+                inline for (.{ "count", "min", "max" }) |name| {
+                    if (std.mem.startsWith(u8, rest, "{" ++ name ++ "}")) {
+                        var buf: [16]u8 = undefined;
+                        const n: u32 = @field(v, name);
+                        try out.appendSlice(arena, if (n == std.math.maxInt(u32)) "any number" else std.fmt.bufPrint(&buf, "{d}", .{n}) catch unreachable);
+                        i += name.len + 2;
+                        continue :outer;
+                    }
+                }
             }
+            try out.append(arena, template[i]);
+            i += 1;
         }
         return out.items;
     }
@@ -1073,6 +1125,10 @@ const Rules = struct {
         tree: *const Tree,
         findings: std.ArrayList(Finding) = .empty,
         scope_results: std.ArrayList(ScopeResult) = .empty,
+        /// Undefined names whose scopes() rule has an on_unresolved function
+        /// to ask first (from Python, once the symbols are available)
+        unresolved: std.ArrayList(Unresolved) = .empty,
+
         /// Nodes grouped by grammar rule: rule r's nodes, in source order,
         /// are by_rule[rule_start[r]..rule_start[r + 1]]. A rule only looks
         /// at the nodes its selector can end on, not at the whole tree.
@@ -1083,6 +1139,8 @@ const Rules = struct {
         by_field: []const u32 = &.{},
         /// 0, 1, 2, ...: the candidates of a selector part without a name
         every_node: ?[]const u32 = null,
+
+        const Unresolved = struct { rule: *const ScopeRule, problem: scopes_mod.Problem };
 
         fn buildIndex(self: *Run) !void {
             const nodes = self.tree.nodes;
@@ -1168,17 +1226,40 @@ const Rules = struct {
             return if (id < self.state.names.rules.len) self.state.names.rules[id] else "?";
         }
 
+        fn values(self: *const Run, node: u32) Values {
+            const flat = self.tree.nodes[node];
+            const fields = self.state.names.fields;
+            const parent = self.tree.parents[node];
+            return .{
+                .text = self.tree.text(node),
+                .rule = self.ruleName(node),
+                .field = if (flat.fieldId() != 0 and flat.fieldId() <= fields.len) fields[flat.fieldId() - 1] else "",
+                .parent = if (parent == NONE) "" else self.ruleName(parent),
+            };
+        }
+
         fn report(self: *Run, rule_idx: usize, node: u32, n: u32) !*Finding {
             const r = self.state.rules.items[rule_idx];
             const flat = self.tree.nodes[node];
+            var v = self.values(node);
+            v.count = n;
+            v.min = r.min;
+            v.max = r.max;
             try self.add(.{
                 .start = flat.text_start,
                 .end = flat.text_end,
                 .severity = r.severity,
                 .code = r.code,
-                .message = try format(self.arena, r.message, self.tree.text(node), self.ruleName(node), n),
+                .message = try format(self.arena, r.message, v),
             });
             return &self.findings.items[self.findings.items.len - 1];
+        }
+
+        /// The nearest ancestor of `node` matching one of `selectors`, or NONE.
+        fn groupOf(self: *const Run, selectors: []const Selector, node: u32) u32 {
+            var p = self.tree.parents[node];
+            while (p != NONE and !self.anyMatches(selectors, p)) p = self.tree.parents[p];
+            return p;
         }
 
         fn anyMatches(self: *const Run, selectors: []const Selector, node: u32) bool {
@@ -1256,24 +1337,31 @@ const Rules = struct {
             try self.scope_results.append(self.arena, .{ .namespace = try self.arena.dupe(u8, sr.namespace), .result = result });
 
             for (result.problems) |p| {
-                const k = @intFromEnum(p.kind);
-                if (sr.levels[k] == .ignore) continue;
-                const flat = t.nodes[p.node];
-                var finding = Finding{
-                    .start = flat.text_start,
-                    .end = flat.text_end,
-                    .severity = if (sr.levels[k] == .err) "error" else "warning",
-                    .code = sr.codes[k],
-                    .message = try format(self.arena, sr.messages[k], t.text(p.node), self.ruleName(p.node), 0),
-                };
-                if (p.other != NONE) {
-                    finding.note = if (p.kind == .shadowed) "the outer definition is here" else "first defined here";
-                    finding.note_start = t.nodes[p.other].text_start;
-                    finding.note_end = t.nodes[p.other].text_end;
-                    finding.has_note = true;
-                }
-                try self.add(finding);
+                if (p.kind == .undefined and sr.on_unresolved != null) {
+                    try self.unresolved.append(self.arena, .{ .rule = sr, .problem = p });
+                } else try self.reportProblem(sr, p);
             }
+        }
+
+        fn reportProblem(self: *Run, sr: *const ScopeRule, p: scopes_mod.Problem) !void {
+            const t = self.tree;
+            const k = @intFromEnum(p.kind);
+            if (sr.levels[k] == .ignore) return;
+            const flat = t.nodes[p.node];
+            var finding = Finding{
+                .start = flat.text_start,
+                .end = flat.text_end,
+                .severity = if (sr.levels[k] == .err) "error" else "warning",
+                .code = sr.codes[k],
+                .message = try format(self.arena, sr.messages[k], self.values(p.node)),
+            };
+            if (p.other != NONE) {
+                finding.note = if (p.kind == .shadowed) "the outer definition is here" else "first defined here";
+                finding.note_start = t.nodes[p.other].text_start;
+                finding.note_end = t.nodes[p.other].text_end;
+                finding.has_note = true;
+            }
+            try self.add(finding);
         }
 
         fn orderU32(a: u32, b: u32) std.math.Order {
@@ -1285,17 +1373,13 @@ const Rules = struct {
             if (cr.kind == .custom) return; // run afterwards, from Python
             if (cr.scope) |sr| return self.checkScopes(sr);
             const t = self.tree;
-            const sel = &cr.selector;
             var chain_buf: [selector.MAX_COMPOUNDS]u32 = undefined;
-            const chain = chain_buf[0..sel.compounds.len];
-            const last = sel.compounds[sel.compounds.len - 1];
 
             switch (cr.kind) {
-                .forbid => for (try self.candidates(last)) |node| {
-                    if (sel.matches(t, node, null)) _ = try self.report(rule_idx, node, 0);
+                .forbid => for (try self.matchAll(cr.selectors)) |node| {
+                    _ = try self.report(rule_idx, node, 0);
                 },
-                .inside => for (try self.candidates(last)) |node| {
-                    if (!sel.matches(t, node, null)) continue;
+                .inside => for (try self.matchAll(cr.selectors)) |node| {
                     var ok = false;
                     var p = t.parents[node];
                     while (p != NONE) : (p = t.parents[p]) {
@@ -1308,39 +1392,57 @@ const Rules = struct {
                     if (!ok) _ = try self.report(rule_idx, node, 0);
                 },
                 .unique => {
-                    // First node seen for each (anchor, text): the selector's
-                    // outermost compound delimits where names must differ
-                    const Key = struct { anchor: u32, text: []const u8 };
+                    // Texts must differ within a group: the nearest `within`
+                    // ancestor, or else what the selector's first part matched
+                    const Match = struct { node: u32, group: u32 };
+                    var found: std.ArrayList(Match) = .empty;
+                    for (cr.selectors) |*sel| {
+                        const chain = chain_buf[0..sel.compounds.len];
+                        for (try self.candidates(sel.compounds[sel.compounds.len - 1])) |node| {
+                            if (!sel.matches(t, node, chain)) continue;
+                            const group = if (cr.within.len != 0) self.groupOf(cr.within, node) else if (sel.compounds.len > 1) chain[0] else NONE;
+                            try found.append(self.arena, .{ .node = node, .group = group });
+                        }
+                    }
+                    std.sort.pdq(Match, found.items, {}, struct {
+                        fn lt(_: void, a: Match, b: Match) bool {
+                            return a.node < b.node;
+                        }
+                    }.lt);
+
+                    const Key = struct { group: u32, text: []const u8 };
                     const Ctx = struct {
                         pub fn hash(_: @This(), k: Key) u64 {
-                            return std.hash.Wyhash.hash(k.anchor, k.text);
+                            return std.hash.Wyhash.hash(k.group, k.text);
                         }
                         pub fn eql(_: @This(), a: Key, b: Key) bool {
-                            return a.anchor == b.anchor and std.mem.eql(u8, a.text, b.text);
+                            return a.group == b.group and std.mem.eql(u8, a.text, b.text);
                         }
                     };
                     var seen: std.HashMapUnmanaged(Key, u32, Ctx, 80) = .empty;
-                    for (try self.candidates(last)) |node| {
-                        if (!sel.matches(t, node, chain)) continue;
-                        const anchor = if (sel.compounds.len > 1) chain[0] else NONE;
-                        const entry = try seen.getOrPut(self.arena, .{ .anchor = anchor, .text = t.text(node) });
+                    var previous: u32 = NONE;
+                    for (found.items) |m| {
+                        if (m.node == previous) continue; // matched by two alternatives
+                        previous = m.node;
+                        const entry = try seen.getOrPut(self.arena, .{ .group = m.group, .text = t.text(m.node) });
                         if (!entry.found_existing) {
-                            entry.value_ptr.* = node;
+                            entry.value_ptr.* = m.node;
                             continue;
                         }
                         const first = t.nodes[entry.value_ptr.*];
-                        const finding = try self.report(rule_idx, node, 0);
+                        const finding = try self.report(rule_idx, m.node, 0);
                         finding.note = "first one is here";
                         finding.note_start = first.text_start;
                         finding.note_end = first.text_end;
                         finding.has_note = true;
                     }
                 },
-                .require => {
-                    // Every node matching all but the last compound needs a
-                    // match of the whole selector hanging from it
+                .require => for (cr.selectors) |*sel| {
+                    // Every node matching all but the last part needs a match
+                    // of the whole selector attached to it
+                    const chain = chain_buf[0..sel.compounds.len];
                     var satisfied: std.AutoHashMapUnmanaged(u32, void) = .empty;
-                    for (try self.candidates(last)) |node| {
+                    for (try self.candidates(sel.compounds[sel.compounds.len - 1])) |node| {
                         if (sel.matches(t, node, chain)) try satisfied.put(self.arena, chain[chain.len - 2], {});
                     }
                     const parent_sel = sel.prefix();
@@ -1349,23 +1451,41 @@ const Rules = struct {
                     }
                 },
                 .count => {
-                    if (sel.compounds.len == 1) {
-                        // No anchor: count over the whole tree
-                        var total: u32 = 0;
-                        for (try self.candidates(last)) |node| total += @intFromBool(sel.matches(t, node, null));
-                        if (t.nodes.len != 0 and (total < cr.min or total > cr.max)) _ = try self.report(rule_idx, 0, total);
+                    var counts: std.AutoHashMapUnmanaged(u32, u32) = .empty;
+                    if (cr.within.len != 0) {
+                        // Count per nearest `within` ancestor
+                        for (try self.matchAll(cr.selectors)) |node| {
+                            const group = self.groupOf(cr.within, node);
+                            if (group == NONE) continue;
+                            const entry = try counts.getOrPut(self.arena, group);
+                            entry.value_ptr.* = if (entry.found_existing) entry.value_ptr.* + 1 else 1;
+                        }
+                        for (try self.matchAll(cr.within)) |group| {
+                            const n = counts.get(group) orelse 0;
+                            if (n < cr.min or n > cr.max) _ = try self.report(rule_idx, group, n);
+                        }
                         return;
                     }
-                    var counts: std.AutoHashMapUnmanaged(u32, u32) = .empty;
-                    for (try self.candidates(last)) |node| {
-                        if (!sel.matches(t, node, chain)) continue;
-                        const entry = try counts.getOrPut(self.arena, chain[0]);
-                        entry.value_ptr.* = if (entry.found_existing) entry.value_ptr.* + 1 else 1;
-                    }
-                    for (try self.candidates(sel.compounds[0])) |node| {
-                        if (!sel.anchorMatches(t, node)) continue;
-                        const n = counts.get(node) orelse 0;
-                        if (n < cr.min or n > cr.max) _ = try self.report(rule_idx, node, n);
+                    for (cr.selectors) |*sel| {
+                        if (sel.compounds.len == 1) {
+                            // No anchor: count over the whole tree
+                            var total: u32 = 0;
+                            for (try self.candidates(sel.compounds[0])) |node| total += @intFromBool(sel.matches(t, node, null));
+                            if (t.nodes.len != 0 and (total < cr.min or total > cr.max)) _ = try self.report(rule_idx, 0, total);
+                            continue;
+                        }
+                        const chain = chain_buf[0..sel.compounds.len];
+                        counts.clearRetainingCapacity();
+                        for (try self.candidates(sel.compounds[sel.compounds.len - 1])) |node| {
+                            if (!sel.matches(t, node, chain)) continue;
+                            const entry = try counts.getOrPut(self.arena, chain[0]);
+                            entry.value_ptr.* = if (entry.found_existing) entry.value_ptr.* + 1 else 1;
+                        }
+                        for (try self.candidates(sel.compounds[0])) |node| {
+                            if (!sel.anchorMatches(t, node)) continue;
+                            const n = counts.get(node) orelse 0;
+                            if (n < cr.min or n > cr.max) _ = try self.report(rule_idx, node, n);
+                        }
                     }
                 },
                 .scopes, .custom => unreachable,
@@ -1420,9 +1540,10 @@ const Rules = struct {
         return py.c.PyObject_Call(cls, args, null);
     }
 
-    /// Call every custom rule's function on its matching nodes.
-    fn runCustom(run: *Run, tree_obj: *PyObject, analysis_obj: *PyObject) bool {
-        var any = false;
+    /// The part of a check that calls into Python, once the symbols exist:
+    /// on_unresolved functions for undefined names, then custom rules.
+    fn runPython(run: *Run, tree_obj: *PyObject, analysis_obj: *PyObject) bool {
+        var any = run.unresolved.items.len != 0;
         for (run.state.rules.items) |r| any = any or r.kind == .custom;
         if (!any) return true;
 
@@ -1439,13 +1560,23 @@ const Rules = struct {
             ctx._code = "custom";
         }
 
+        for (run.unresolved.items) |u| {
+            const k = @intFromEnum(u.problem.kind);
+            ctx._code = u.rule.codes[k];
+            const node_obj = py.c.PyObject_CallMethod(tree_obj, "node", "I", u.problem.node) orelse return false;
+            defer py.Py_DecRef(node_obj);
+            const result = py.c.PyObject_CallFunctionObjArgs(u.rule.on_unresolved.?, node_obj, ctx_obj, @as(?*PyObject, null)) orelse return false;
+            defer py.Py_DecRef(result);
+            const known = py.c.PyObject_IsTrue(result);
+            if (known < 0) return false;
+            if (known == 0) run.reportProblem(u.rule, u.problem) catch return oomObject() != null;
+        }
+
         for (run.state.rules.items) |*r| {
             const function = r.callback orelse continue;
             ctx._code = r.code;
-            const sel = &r.selector;
-            const nodes = run.candidates(sel.compounds[sel.compounds.len - 1]) catch return oomObject() != null;
+            const nodes = run.matchAll(r.selectors) catch return oomObject() != null;
             for (nodes) |node| {
-                if (!sel.matches(run.tree, node, null)) continue;
                 const node_obj = py.c.PyObject_CallMethod(tree_obj, "node", "I", node) orelse return false;
                 defer py.Py_DecRef(node_obj);
                 const result = py.c.PyObject_CallFunctionObjArgs(function, node_obj, ctx_obj, @as(?*PyObject, null)) orelse return false;
@@ -1543,7 +1674,7 @@ const Rules = struct {
         data.results = run.scope_results.items;
         data.objects = objects;
 
-        if (!runCustom(&run, tree_obj, analysis_obj)) return null;
+        if (!runPython(&run, tree_obj, analysis_obj)) return null;
 
         std.sort.pdq(Finding, run.findings.items, {}, Finding.before);
 

@@ -64,20 +64,31 @@ A selector picks nodes of the parse tree, in the spirit of CSS.
 | `call:not(.value)` | a `call` that is not labelled `value` (any single part can be negated) |
 | `call:has(> .args)` | a `call` with a child labelled `args`; `:has(x)` without `>` looks at all descendants |
 | `.params:nth(2)` | the second `.params` among its siblings; also `:first` and `:last` |
+| `let + expr` | an `expr` right after a `let` sibling; `let ~ expr`: anywhere after it |
+| `break, return` | either one: wherever a selector is accepted, so is a comma-separated list or a sequence of selectors |
 
 A name is a grammar rule name or a class name; a class name stands for every rule mapped to it, so `BinOp` covers `sum`, `product` and `compare` alike. Unknown names and labels are rejected when the rules are compiled, not silently ignored. Remember that `@silent` rules make no nodes and cannot be selected. A selector has at most 16 parts.
 
 ## Rules
 
-Every rule takes `message`, `code` and `severity` (`"error"`, `"warning"` or `"note"`). In a message, `{text}` is the flagged node's text, `{rule}` its rule name and `{count}` the number counted.
+Every rule takes `message`, `code` and `severity` (`"error"`, `"warning"` or `"note"`). A message can use these placeholders:
+
+| | |
+|---|---|
+| `{text}` | the flagged node's text |
+| `{rule}`, `{field}` | its rule name and its label (empty without one) |
+| `{parent}` | its parent's rule name |
+| `{count}`, `{min}`, `{max}` | for `count`: the number found and the allowed range |
 
 | Rule | Reports |
 |------|---------|
 | `inside(selector, within, stop_at=None)` | a match with no ancestor matching `within` (a selector or several), looking no further up than an ancestor matching `stop_at` |
-| `unique(selector)` | a match whose text was already seen within the node the selector's first part matched (the whole tree for a one-part selector); the first occurrence is attached as a note |
+| `unique(selector, within=None)` | a match whose text was already seen in its group; the first occurrence is attached as a note |
 | `forbid(selector)` | every match |
 | `require(selector)` | a node matching all but the last part of the selector with no match of the whole selector: `require("funcdef > block")` |
-| `count(selector, exactly=None, min=None, max=None)` | a node matching the selector's first part with the wrong number of matches inside it |
+| `count(selector, exactly=None, min=None, max=None, within=None)` | a group with the wrong number of matches |
+
+For `unique` and `count`, a group is the nearest ancestor matching `within`: `unique("Let > .name, .params", within="FuncDef")` makes variables and parameters unique per function. Without `within`, the group is the node the selector's first part matched (`unique("FuncDef > .params")`), or the whole tree for a one-part selector.
 
 ## Scopes and names
 
@@ -107,7 +118,9 @@ scopes(
 | `on_unused` | `"ignore"` | a definition that is never used |
 | `on_shadow` | `"ignore"` | a definition hiding one in an outer scope |
 
-Each is `"error"`, `"warning"` or `"ignore"`. `messages={"undefined": "unknown variable '{text}'"}` and `codes={"undefined": "E100"}` override the texts and codes, with the keys `undefined`, `redefined`, `unused` and `shadowed`.
+Each is `"error"`, `"warning"` or `"ignore"`. For names the declarative options can't account for (names provided by the host, implicit globals), `on_unresolved=function` is asked about every use that resolves to nothing: `function(node, ctx)` returns true if the name is fine after all, and may report its own diagnostic through `ctx`.
+
+Languages where assignment defines a variable need no special support: list the assignment target in `define` and set `on_redefine="ignore"`; the first assignment is the definition. `messages={"undefined": "unknown variable '{text}'"}` and `codes={"undefined": "E100"}` override the texts and codes, with the keys `undefined`, `redefined`, `unused` and `shadowed`.
 
 Several `scopes()` rules give separate namespaces; name them with `namespace="function"`.
 

@@ -11,6 +11,8 @@
 //!     call:has(> .args)    a `call` with a child labelled `args` (`:has(x)`: a descendant)
 //!     .params:nth(2)       the second child labelled `params` of its parent
 //!     .params:first  .params:last
+//!     let + expr           an `expr` right after a `let` sibling (`let ~ expr`: anywhere after)
+//!     break, return        either one (where a selector list is accepted)
 //!
 //! A name is a grammar rule name or the name of a `-> Class` action; a class
 //! name stands for every rule mapped to it.
@@ -58,8 +60,21 @@ pub const Compound = struct {
     nth: u32 = 0,
     /// `:last`: no later sibling matches this compound
     last: bool = false,
-    /// How it relates to the compound on its left: any ancestor, or the parent
-    descendant: bool = false,
+    /// How it relates to the compound on its left
+    relation: Relation = .first,
+};
+
+pub const Relation = enum {
+    /// The leftmost compound: no relation
+    first,
+    /// `a > b`: b's parent
+    child,
+    /// `a b`: any ancestor of b
+    descendant,
+    /// `a + b`: the sibling just before b
+    next,
+    /// `a ~ b`: any sibling before b
+    later,
 };
 
 pub const Error = error{ EmptySelector, UnknownName, UnknownField, BadSelector, OutOfMemory };
@@ -134,11 +149,28 @@ pub const Selector = struct {
         if (chain) |c| c[k] = node;
         if (k == 0) return true;
         var parent = t.parents[node];
-        if (!self.compounds[k].descendant) return parent != NONE and self.matchFrom(t, k - 1, parent, chain);
-        while (parent != NONE) : (parent = t.parents[parent]) {
-            if (self.matchFrom(t, k - 1, parent, chain)) return true;
+        switch (self.compounds[k].relation) {
+            .first => return true,
+            .child => return parent != NONE and self.matchFrom(t, k - 1, parent, chain),
+            .descendant => {
+                while (parent != NONE) : (parent = t.parents[parent]) {
+                    if (self.matchFrom(t, k - 1, parent, chain)) return true;
+                }
+                return false;
+            },
+            .next, .later => {
+                if (parent == NONE) return false;
+                // The siblings before `node`, nearest last
+                var previous: u32 = NONE;
+                var sibling = parent + 1;
+                while (sibling < node) : (sibling = t.end(sibling)) {
+                    if (self.compounds[k].relation == .later and self.matchFrom(t, k - 1, sibling, chain)) return true;
+                    previous = sibling;
+                }
+                if (self.compounds[k].relation == .later or previous == NONE) return false;
+                return self.matchFrom(t, k - 1, previous, chain);
+            },
         }
-        return false;
     }
 
     /// Does `node` match? If so and `chain` is given (one slot per
@@ -305,9 +337,14 @@ const Parser = struct {
             const before = self.pos;
             self.skipSpaces();
             if (self.pos == self.text.len) break;
-            var descendant = true;
-            if (self.text[self.pos] == '>') {
-                descendant = false;
+            var relation: Relation = .descendant;
+            const combinator = self.text[self.pos];
+            if (combinator == '>' or combinator == '+' or combinator == '~') {
+                relation = switch (combinator) {
+                    '>' => .child,
+                    '+' => .next,
+                    else => .later,
+                };
                 self.pos += 1;
                 self.skipSpaces();
             } else if (self.pos == before) {
@@ -315,7 +352,7 @@ const Parser = struct {
                 return error.BadSelector;
             }
             var c = try self.compound();
-            c.descendant = descendant;
+            c.relation = relation;
             try compounds.append(self.arena, c);
             if (compounds.items.len > MAX_COMPOUNDS) return error.BadSelector;
         }
@@ -331,4 +368,26 @@ pub fn compile(arena: Allocator, names: Names, text: []const u8, bad_name: *[]co
         bad_name.* = p.bad_name;
         return e;
     };
+}
+
+/// Compile a comma-separated list of selectors (`break, return`): the
+/// alternatives, in order. Commas inside `[...]` and `(...)` don't split.
+pub fn compileList(arena: Allocator, names: Names, text: []const u8, bad_name: *[]const u8) Error![]Selector {
+    var out: std.ArrayList(Selector) = .empty;
+    var depth: usize = 0;
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i <= text.len) : (i += 1) {
+        if (i < text.len) {
+            switch (text[i]) {
+                '[', '(' => depth += 1,
+                ']', ')' => depth -|= 1,
+                else => {},
+            }
+            if (text[i] != ',' or depth != 0) continue;
+        }
+        try out.append(arena, try compile(arena, names, text[start..i], bad_name));
+        start = i + 1;
+    }
+    return out.items;
 }

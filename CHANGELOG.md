@@ -5,6 +5,11 @@ All notable changes to zrules are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.5] - 2026-10-01
+
+### Changed
+- **`Analysis.capsule`** is now `"zrules.analysis.v2"` (ABI 2): it also lists the keys of the modules each file imports, found in the project or not. A tool checking part of a project (an editor re-checking the files an edit can affect) learns which other files to bring in.
+
 ## [0.1.4] - 2026-10-01
 
 ### Added

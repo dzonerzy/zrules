@@ -115,6 +115,7 @@ class AnalysisView(ctypes.Structure):
     _fields_ = [
         ("abi", ctypes.c_uint32), ("symbol_count", ctypes.c_uint32), ("symbols", ctypes.POINTER(SymbolView)),
         ("uses", ctypes.POINTER(Span)), ("use_nodes", ctypes.POINTER(ctypes.c_uint32)),
+        ("import_count", ctypes.c_uint32), ("imports", ctypes.POINTER(Str)),
     ]
 
 
@@ -137,11 +138,12 @@ def opt(v):
 class TestCapsules:
     def test_analysis(self):
         project = RULES.analyze_project({"lib": "struct P { a: int; }\nfn f(x: int) -> P { return P(x); }\n", "main": "from lib import f;\nlet p = f(1);\nprint(p.a);\n"})
-        for key in ("lib", "main"):
+        for key, imports in (("lib", []), ("main", ["lib"])):
             analysis = project.file(key)
             capsule = analysis.capsule
-            view = AnalysisView.from_address(GetPointer(capsule, b"zrules.analysis.v1"))
-            assert view.abi == 1 and view.symbol_count == len(analysis.symbols)
+            view = AnalysisView.from_address(GetPointer(capsule, b"zrules.analysis.v2"))
+            assert view.abi == 2 and view.symbol_count == len(analysis.symbols)
+            assert [view.imports[k].get() for k in range(view.import_count)] == imports
             for i, s in enumerate(analysis.symbols):
                 v = view.symbols[i]
                 assert v.name.get() == s.name and v.namespace.get() == s.namespace
@@ -154,9 +156,14 @@ class TestCapsules:
                 assert [view.use_nodes[v.uses_start + k] for k in range(v.uses_len)] == list(s.uses)
                 origin = (v.origin_key.get(), v.origin_node) if v.origin_key.get() is not None else None
                 assert origin == (tuple(s.origin) if s.origin else None)
+        # an import of a file that isn't there is listed too (an editor
+        # checks the file with it once it appears)
+        project = RULES.analyze_project({"main": "from lib import f;\nimport other;\nfrom lib import g;\n"})
+        view = AnalysisView.from_address(GetPointer(project.file("main").capsule, b"zrules.analysis.v2"))
+        assert [view.imports[k].get() for k in range(view.import_count)] == ["lib", "other"]
         # (the capsule keeps its analysis alive)
         capsule = RULES.analyze("let a = 1;").capsule
-        view = AnalysisView.from_address(GetPointer(capsule, b"zrules.analysis.v1"))
+        view = AnalysisView.from_address(GetPointer(capsule, b"zrules.analysis.v2"))
         assert "a" in [view.symbols[i].name.get() for i in range(view.symbol_count)]
 
     def test_selector(self):

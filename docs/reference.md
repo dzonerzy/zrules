@@ -262,11 +262,11 @@ What a custom rule's function (and `on_unresolved`) receives as `ctx`.
 
 ## Native access
 
-For native code in other packages (zlsp reads its results this way), zrules hands out two capsules. Their layout is [`src/native_abi.zig`](https://github.com/dzonerzy/zrules/blob/main/src/native_abi.zig); check the `abi` field (currently `1`) before reading anything else. What a capsule points to stays valid while the capsule is referenced.
+For native code in other packages (zlsp reads its results this way), zrules hands out two capsules. Their layout is [`src/native_abi.zig`](https://github.com/dzonerzy/zrules/blob/main/src/native_abi.zig); check the `abi` field before reading anything else (it is also in the capsule's name). What a capsule points to stays valid while the capsule is referenced.
 
 | | |
 |---|---|
-| `analysis.capsule` | `"zrules.analysis.v1"`: an `AnalysisView`, every symbol (`SymbolView`: name, namespace, type text, defining node and span, scope, owned scope, uses as spans and nodes, import origin, builtin flag) in the order of `analysis.symbols`, without a Python object per symbol or use |
+| `analysis.capsule` | `"zrules.analysis.v2"` (`abi` 2): an `AnalysisView`, every symbol (`SymbolView`: name, namespace, type text, defining node and span, scope, owned scope, uses as spans and nodes, import origin, builtin flag) in the order of `analysis.symbols`, without a Python object per symbol or use; and in a project, the keys of the files it imports |
 | `Selector(parser, text).capsule` | `"zrules.selector.v1"`: a `SelectorView` whose `match(ctx, tree_view, out)` writes the matching nodes of a zgram tree (a `zgram.tree.v1` capsule's `TreeView`) into `out`, and returns how many (-1 out of memory, -2 another grammar). It needs no GIL |
 
 ## Limits

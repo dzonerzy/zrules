@@ -687,6 +687,9 @@ const AnalysisData = struct {
     type_share: ?*TypeShare = null,
     /// The symbols for native code (Analysis.capsule), once asked for
     view: ?*native_abi.AnalysisView = null,
+    /// In a project: the keys this file's imports ask for (found or not),
+    /// each once
+    imported: []const []const u8 = &.{},
 
     /// The symbol table as native_abi.AnalysisView, built once in the
     /// arena. Needs the GIL (it reads the project's keys).
@@ -742,8 +745,17 @@ const AnalysisData = struct {
                 si += 1;
             }
         }
+        const imports = try arena.alloc(native_abi.Str, self.imported.len);
+        for (imports, self.imported) |*slot, key| slot.* = .{ .ptr = key.ptr, .len = key.len };
         const view = try arena.create(native_abi.AnalysisView);
-        view.* = .{ .symbol_count = @intCast(n_syms), .symbols = syms.ptr, .uses = uses.ptr, .use_nodes = use_nodes.ptr };
+        view.* = .{
+            .symbol_count = @intCast(n_syms),
+            .symbols = syms.ptr,
+            .uses = uses.ptr,
+            .use_nodes = use_nodes.ptr,
+            .import_count = @intCast(imports.len),
+            .imports = imports.ptr,
+        };
         self.view = view;
         return view;
     }
@@ -2295,26 +2307,32 @@ const Rules = struct {
         /// a module's text (minus quotes) is the key of its file.
         resolver: ?*PyObject,
 
-        /// The index of the file that `module`, written in file `from`,
-        /// refers to; null if there is none.
-        fn resolve(self: *const Link, from: usize, module: []const u8) error{PythonError}!?u32 {
+        /// The file that `module`, written in file `from`, refers to (an
+        /// index; null if there is none), and the key asked for (a str key,
+        /// copied into `arena`; found or not).
+        fn resolve(self: *const Link, arena: std.mem.Allocator, from: usize, module: []const u8) error{ PythonError, OutOfMemory }!struct { file: ?u32, key: ?[]const u8 } {
             if (self.resolver) |function| {
                 const text = py.PyUnicode_FromStringAndSize(module.ptr, @intCast(module.len)) orelse return error.PythonError;
                 defer py.Py_DecRef(text);
                 const key = py.c.PyObject_CallFunctionObjArgs(function, text, self.keys[from], @as(?*PyObject, null)) orelse return error.PythonError;
                 defer py.Py_DecRef(key);
-                if (key == py.Py_None()) return null;
+                if (key == py.Py_None()) return .{ .file = null, .key = null };
+                var wanted: ?[]const u8 = null;
+                if (py.PyUnicode_Check(key)) {
+                    var len: py.Py_ssize_t = 0;
+                    if (py.c.PyUnicode_AsUTF8AndSize(key, &len)) |ptr| wanted = try arena.dupe(u8, ptr[0..@intCast(len)]) else py.c.PyErr_Clear();
+                }
                 const found = py.c.PyDict_GetItemWithError(self.by_key.?, key) orelse {
                     // Not a key of the project (one that can't be hashed is none of them)
                     py.c.PyErr_Clear();
-                    return null;
+                    return .{ .file = null, .key = wanted };
                 };
-                return @intCast(py.c.PyLong_AsUnsignedLong(found));
+                return .{ .file = @intCast(py.c.PyLong_AsUnsignedLong(found)), .key = wanted };
             }
             var name = module;
             if (name.len >= 2 and (name[0] == '"' or name[0] == '\'') and name[name.len - 1] == name[0]) name = name[1 .. name.len - 1];
-            if (name.len == 0) return null;
-            return self.by_text.get(name);
+            if (name.len == 0) return .{ .file = null, .key = null };
+            return .{ .file = self.by_text.get(name), .key = name };
         }
     };
 
@@ -2366,6 +2384,8 @@ const Rules = struct {
             wildcard: bool,
             /// The file the module is, once resolved (NONE: no such file)
             target: u32 = NONE,
+            /// The key it asked for, found or not (null: none, or not a str)
+            wanted: ?[]const u8 = null,
         };
 
         /// What a scopes() rule matched in this file, kept between the two
@@ -2914,7 +2934,15 @@ const Rules = struct {
         /// the files are finished in parallel: a resolver is Python code.
         fn resolveImports(self: *Run, index: usize, link: *const Link, file: usize) error{PythonError}!void {
             for (self.scope_inputs.items[index].imports) |*import| {
-                import.target = (try link.resolve(file, self.tree.text(import.module))) orelse NONE;
+                const r = link.resolve(self.arena, file, self.tree.text(import.module)) catch |e| switch (e) {
+                    error.OutOfMemory => {
+                        _ = py.c.PyErr_NoMemory();
+                        return error.PythonError;
+                    },
+                    else => |other| return other,
+                };
+                import.target = r.file orelse NONE;
+                import.wanted = r.key;
             }
         }
 
@@ -3790,6 +3818,19 @@ const Rules = struct {
         }
         f.data.results = run.scope_results.items;
         f.data.objects = objects;
+        // The keys it imports (found or not), for tools that re-check only
+        // what an edit affects
+        var imported: std.ArrayList([]const u8) = .empty;
+        for (run.scope_inputs.items) |input| {
+            next: for (input.imports) |import| {
+                const key = import.wanted orelse continue;
+                for (imported.items) |seen| {
+                    if (std.mem.eql(u8, seen, key)) continue :next;
+                }
+                imported.append(arena, key) catch return oomObject() != null;
+            }
+        }
+        f.data.imported = imported.items;
         if (keys) |share| {
             share.refs += 1;
             f.data.key_share = share;

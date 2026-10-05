@@ -5,6 +5,11 @@ All notable changes to zrules are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **`rules.analyze(source, builtins=[...])`**: names the environment defines, for this analysis only, besides the rules' own builtins (those of the first `scopes()` rule). A REPL checks each entry with the names its earlier entries defined; a program defining one of them again has its own symbol.
+
 ## [0.1.5] - 2026-10-01
 
 ### Changed

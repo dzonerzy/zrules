@@ -2351,6 +2351,10 @@ const Rules = struct {
         /// The broken text of a recovered tree; null for a tree without
         /// syntax errors
         broken: ?*const Broken = null,
+        /// Names the environment defines, for this analysis only
+        /// (Rules.analyze(builtins=)): builtins of the first scopes() rule
+        /// besides its own. Live as long as the analysis call.
+        extra_builtins: []const []const u8 = &.{},
 
         /// Nodes grouped by grammar rule: rule r's nodes, in source order,
         /// are by_rule[rule_start[r]..rule_start[r + 1]]. A rule only looks
@@ -2989,8 +2993,10 @@ const Rules = struct {
             }
 
             // The Analysis may outlive the Rules: names it keeps must live in its arena
-            const builtins = try self.arena.alloc([]const u8, sr.builtins.len);
-            for (builtins, sr.builtins) |*slot, name| slot.* = try self.arena.dupe(u8, name);
+            const extra = if (index == 0) self.extra_builtins else &.{};
+            const builtins = try self.arena.alloc([]const u8, sr.builtins.len + extra.len);
+            for (builtins[0..sr.builtins.len], sr.builtins) |*slot, name| slot.* = try self.arena.dupe(u8, name);
+            for (builtins[sr.builtins.len..], extra) |*slot, name| slot.* = try self.arena.dupe(u8, name);
 
             var result = try scopes_mod.analyze(self.arena, t, input.scope_nodes, input.defs, input.uses, input.members, builtins, externals.items, .{
                 .ordered = sr.ordered,
@@ -3322,9 +3328,17 @@ const Rules = struct {
     }
 
     /// Check a tree and return everything found: diagnostics and symbols.
-    pub fn analyze(self: *Rules, args: pyoz.Args(struct { source: *PyObject, recover: bool = false })) pyoz.Signature(?*PyObject, "Analysis") {
+    /// `builtins`: names the environment defines besides the rules'
+    /// builtins, for this analysis (a REPL's earlier definitions).
+    pub fn analyze(self: *Rules, args: pyoz.Args(struct { source: *PyObject, recover: bool = false, builtins: ?*PyObject = null })) pyoz.Signature(?*PyObject, "Analysis") {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const extra: []const []const u8 = if (args.value.builtins) |b|
+            (if (b == py.Py_None()) &.{} else strings(arena.allocator(), b, "builtins", false) orelse return .{ .value = null })
+        else
+            &.{};
         var out: [1]*PyObject = undefined;
-        if (!self.analyzeFiles(&.{args.value.source}, null, null, args.value.recover, &out)) return .{ .value = null };
+        if (!self.analyzeFilesWith(&.{args.value.source}, null, null, args.value.recover, extra, &out)) return .{ .value = null };
         return .{ .value = out[0] };
     }
 
@@ -3502,6 +3516,12 @@ const Rules = struct {
     /// alone, whose imports can't be followed). On success `out` receives a
     /// new reference to each file's Analysis.
     fn analyzeFiles(self: *Rules, sources: []const *PyObject, keys: ?[]const *PyObject, resolver: ?*PyObject, recover: bool, out: []*PyObject) bool {
+        return self.analyzeFilesWith(sources, keys, resolver, recover, &.{}, out);
+    }
+
+    /// analyzeFiles, with names the environment defines (`extra`: each
+    /// file's, Rules.analyze(builtins=)).
+    fn analyzeFilesWith(self: *Rules, sources: []const *PyObject, keys: ?[]const *PyObject, resolver: ?*PyObject, recover: bool, extra: []const []const u8, out: []*PyObject) bool {
         const state = self._state orelse {
             raise(py.PyExc_RuntimeError(), "Rules is not initialized", .{});
             return false;
@@ -3516,6 +3536,7 @@ const Rules = struct {
         for (sources) |source| {
             files[opened] = self.openFile(state, source, recover) orelse return false;
             files[opened].run.in_project = keys != null;
+            files[opened].run.extra_builtins = extra;
             opened += 1;
         }
 
@@ -3896,7 +3917,7 @@ const Rules = struct {
 
     pub const __doc__: [*:0]const u8 = "Rules(parser, rules=None): rules compiled against a zgram parser's grammar. check(source) returns the zgram.Diagnostic of every violation, in source order; analyze(source) also returns the symbols found by scopes() rules.";
     pub const check__doc__: [*:0]const u8 = "Check a zgram Tree or Node (or source text, parsed first; with recover=True a syntax error doesn't raise) against the rules. Returns a list of zgram.Diagnostic in source order. For a tree parsed with recover=True, its syntax errors are in the list, and nothing is reported about the broken text.";
-    pub const analyze__doc__: [*:0]const u8 = "Like check(), but returns an Analysis: diagnostics, tree, symbols, and resolve(node) / at(offset) to look names up.";
+    pub const analyze__doc__: [*:0]const u8 = "Like check(), but returns an Analysis: diagnostics, tree, symbols, and resolve(node) / at(offset) to look names up. builtins: names the environment defines besides the rules' builtins (the first scopes() rule's), for this analysis only: a REPL's earlier definitions.";
     pub const analyze_project__doc__: [*:0]const u8 = "Check several files together, resolving the imports between them. files is a dict of key -> source; resolve(module_text, importing_key) returns the key of the file a module name refers to, or None (default: the module's text, without quotes, is the key); recover=True parses text sources with syntax error recovery. Returns a Project.";
     pub const add__doc__: [*:0]const u8 = "Add a custom rule: function(node, ctx) is called for every node matching the selector. Returns the function.";
     pub const rule__doc__: [*:0]const u8 = "Decorator form of add(): @rules.rule('Call') above a function(node, ctx).";

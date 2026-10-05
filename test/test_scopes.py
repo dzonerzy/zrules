@@ -83,6 +83,22 @@ class TestDiagnostics:
         assert make(parser, builtins=("print", "len")).check("print(len(print));") == []
         assert found(make(parser, builtins="print"), "print(len);") == [("undefined-name", 1, 7, "len")]
 
+    def test_builtins_of_one_analysis(self, parser):
+        # (a REPL's earlier definitions: known as builtins, for this
+        # analysis only, besides the rules' own)
+        rules = make(parser, builtins="print")
+        analysis = rules.analyze("print(x, y);", builtins=["x", "y"])
+        assert analysis.diagnostics == []
+        named = {s.name: s for s in analysis.symbols}
+        assert named["x"].node is None and named["print"].node is None
+        assert len(named["x"].uses) == 1
+        assert found(rules, "print(x);") == [("undefined-name", 1, 7, "x")]
+        assert rules.analyze("print(x);", builtins=None).diagnostics[0].code == "undefined-name"
+        # (defined again: the program's own)
+        again = rules.analyze("let x = 1; print(x);", builtins=["x"])
+        assert again.diagnostics == []
+        assert [(s.node is None, len(s.uses)) for s in again.symbols if s.name == "x"] == [(True, 0), (False, 1)]
+
     def test_unused(self, parser):
         rules = make(parser, on_unused="warning")
         ds = rules.check("let a = 1; fn f(p, q) { return p; }")

@@ -3,7 +3,6 @@
 import gc
 
 import pytest
-import zgram
 from zrules import Rules, custom, forbid, scopes
 
 
@@ -35,7 +34,9 @@ def test_decorator(parser):
 
 def test_add(parser):
     rules = Rules(parser)
-    fn = lambda node, ctx: ctx.warning(node, "a call")
+    def fn(node, ctx):
+        ctx.warning(node, "a call")
+
     assert rules.add("Call", fn) is fn
     (d,) = rules.check("f();")
     assert (d.severity, d.code) == ("warning", "custom")

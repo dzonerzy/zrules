@@ -5,7 +5,7 @@ All notable changes to zrules are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.0] - 2026-10-08
 
 ### Added
 - **Generic functions and types** (`types()`, children `tparams` of `functions` and `structs`): `fn first[T](xs: list[T]) -> T`, `struct Box[T] { value: T; }`. A call works out the type parameters from its arguments, part by part, and types its result with them (`first([1])` is an `int`); a parameter it can't tell is `unknown`. `Box[int]` (a `type_args` whose base names the struct) is an instance; calling `Box` makes the one its arguments say; an instance's fields and methods have its arguments. Inside, a type parameter is a type of its own.

@@ -5,7 +5,7 @@ build-backend = "pyoz.backend"
 [project]
 # zsuite packages are named <name>-py on PyPI; the import name stays `zrules` (module-name below)
 name = "zrules-py"
-version = "0.1.7"
+version = "0.2.0"
 description = "Static semantics for languages parsed with zgram: structural rules, scopes and symbol tables, types, control flow, native and fast."
 requires-python = ">=3.10"
 readme = "README.md"

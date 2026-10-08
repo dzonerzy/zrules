@@ -152,6 +152,158 @@ class TestGenerics:
         assert messages("fn f(a: set[int]) { let b: list[int] = a; }") == ["expected 'list[int]', got 'set[int]'"]
 
 
+class TestGenericFunctions:
+    def test_the_result_is_what_the_arguments_say(self):
+        source = "fn first[T](xs: list[T]) -> T { return xs[0]; } let a = first([1, 2]); let b = first([\"s\"]);"
+        assert problems(source) == []
+        types = symbol_types(source)
+        assert types["a"] == "int" and types["b"] == "str"
+        assert types["first"] == "fn(list[T]) -> T"
+
+    def test_the_result_checked_where_it_goes(self):
+        source = "fn id[T](x: T) -> T { return x; } let a: str = id(1);"
+        assert messages(source) == ["expected 'str', got 'int'"]
+
+    def test_arguments_must_agree(self):
+        source = "fn pair[T](a: T, b: T) -> T { return a; } let x = pair(1, \"s\");"
+        assert messages(source) == ["argument 2 of pair(): expected 'int', got 'str'"]
+        # (an int, then a float: float, the wider)
+        assert symbol_types("fn pair[T](a: T, b: T) -> T { return a; } let y = pair(1, 2.5);")["y"] == "float"
+
+    def test_a_parameter_is_its_own_type_inside(self):
+        assert messages("fn f[T](x: T) -> int { return x; }") == ["expected to return 'int', got 'T'"]
+        assert messages("fn f[T](x: T) { let y: T = 5; }") == ["expected 'T', got 'int'"]
+        assert problems("fn f[T](x: T) -> list[T] { return [x, x]; }") == []
+
+    def test_one_the_arguments_dont_say_is_unknown(self):
+        source = "fn make[T]() -> list[T] { return []; } let a: list[str] = make();"
+        assert problems(source) == []
+
+    def test_part_by_part(self):
+        source = "fn flat[T](xs: list[list[T]]) -> list[T] { return xs[0]; } let a = flat([[1], [2]]);"
+        assert problems(source) == []
+        assert symbol_types(source)["a"] == "list[int]"
+        assert messages("fn keys[K, V](m: map[K, V]) -> K { return keys(m); } fn f(m: map[str, int]) { let k: int = keys(m); }") == [
+            "expected 'int', got 'str'"
+        ]
+
+    def test_through_function_arguments(self):
+        # (types of builtins: functions taking functions)
+        rules = make(
+            scope_options={"builtins": ("print", "len", "list", "map", "set", "apply")},
+            builtins={"print": "fn(...) -> void", "len": "fn(any) -> int", "apply": "fn(fn(int) -> str, int) -> str"},
+        )
+        assert problems("fn show(n: int) -> str { return \"n\"; } let s: str = apply(show, 1);", rules) == []
+        assert messages("fn show(n: str) -> str { return n; } let s = apply(show, 1);", rules) == [
+            "argument 1 of apply(): expected 'fn(int) -> str', got 'fn(str) -> str'"
+        ]
+
+    def test_optional_parameter_takes_a_value(self):
+        source = "fn or_else[T](x: T?, d: T) -> T { return d; } let a = or_else(1, 2);"
+        assert symbol_types(source)["a"] == "int"
+
+
+class TestGenericStructs:
+    BOX = "struct Box[T] { value: T; fn get() -> T { return value; } } "
+
+    def test_instances_fields_and_methods(self):
+        source = self.BOX + "let b: Box[int] = Box(5); let v = b.value; let g = b.get();"
+        assert problems(source) == []
+        types = symbol_types(source)
+        assert types["b"] == "Box[int]" and types["v"] == "int" and types["g"] == "int"
+
+    def test_constructor_infers_the_instance(self):
+        source = self.BOX + "let b = Box(\"s\");"
+        assert symbol_types(source)["b"] == "Box[str]"
+        assert messages(self.BOX + "let b: Box[int] = Box(\"s\");") == ["expected 'Box[int]', got 'Box[str]'"]
+
+    def test_the_fields_as_the_instance_has_them(self):
+        assert messages(self.BOX + "fn f(b: Box[str]) { let n: int = b.value; }") == ["expected 'int', got 'str'"]
+        assert messages(self.BOX + "let b: Box[int] = Box(1); b.value = \"s\";") == ["expected 'int', got 'str'"]
+
+    def test_type_arguments_counted(self):
+        assert messages(self.BOX + "let b: Box[int, str] = Box(1);") == ["'Box' takes 1 type argument, got 2"]
+
+    def test_written_without_arguments_it_is_any_instance(self):
+        assert problems(self.BOX + "fn f(b: Box) -> int { let x = b.value; return 1; } let n = f(Box(1));") == []
+
+    def test_two_parameters(self):
+        source = "struct Pair[A, B] { a: A; b: B; } let p = Pair(1, \"s\"); let x: str = p.b; let y: str = p.a;"
+        assert messages(source) == ["expected 'str', got 'int'"]
+        assert symbol_types(source)["p"] == "Pair[int, str]"
+
+
+class TestUnions:
+    def test_a_value_fits_a_member(self):
+        assert problems("let a: int | str = 1; let b: int | str = \"s\";") == []
+        assert messages("let a: int | str = 1.5;") == ["expected 'int | str', got 'float'"]
+
+    def test_a_union_fits_where_every_member_does(self):
+        assert problems("fn f(x: int | float) -> float { return x; }") == []
+        assert messages("fn f(x: int | str) -> int { return x; }") == ["expected to return 'int', got 'int | str'"]
+        assert problems("fn f(x: int | str) -> str | int | bool { return x; }") == []
+
+    def test_spelled_sorted_and_once(self):
+        assert symbol_types("fn f(x: str | int | str) { }")["x"] == symbol_types("fn f(x: int | str) { }")["x"]
+        assert symbol_types("fn f(x: (int | str)?) { }")["x"] == "(int | str)?"
+
+    def test_optionals_and_nil(self):
+        assert problems("fn f(x: int?) { let y: int | nil = x; let z: int | nil = nil; }") == []
+        assert messages("fn f(x: str?) { let y: int | nil = x; }") == ["expected 'int | nil', got 'str?'"]
+
+    def test_an_operator_on_every_member(self):
+        assert problems("fn f(x: int | float) -> float { return x + 1; }") == []
+        assert messages("fn f(x: int | str) { let y = x - 1; }") == ["operator '-' cannot be applied to 'int | str' and 'int'"]
+
+    def test_a_field_every_member_has(self):
+        source = "struct A { n: int; s: str; } struct B { n: float; } fn f(x: A | B) -> float { return x.n; }"
+        assert problems(source) == []
+        assert messages(source.replace("x.n", "x.s")) == ["'A | B' has no field 's'"]
+
+
+class TestSubtypes:
+    SHAPES = "struct Shape { name: str; fn area() -> float { return 0.0; } } struct Circle : Shape { r: float; } "
+
+    def test_a_subtype_fits_its_base(self):
+        assert problems(self.SHAPES + "let s: Shape = Circle(\"c\", 1.0);") == []
+        assert messages(self.SHAPES + "let c: Circle = Shape(\"s\");") == ["expected 'Circle', got 'Shape'"]
+
+    def test_inherited_fields_and_methods(self):
+        source = self.SHAPES + "let c = Circle(\"c\", 1.0); let n: str = c.name; let a: float = c.area(); let r: float = c.r;"
+        assert problems(source) == []
+        assert messages(self.SHAPES + "let c = Circle(1.0);") == ["Circle() takes 2 arguments, got 1"]
+
+    def test_through_a_chain_and_in_calls(self):
+        source = self.SHAPES + "struct Ring : Circle { inner: float; } fn name(s: Shape) -> str { return s.name; } let n = name(Ring(\"r\", 2.0, 1.0));"
+        assert problems(source) == []
+        assert messages(self.SHAPES + "struct Other { x: int; } fn name(s: Shape) -> str { return s.name; } let n = name(Other(1));") == [
+            "argument 1 of name(): expected 'Shape', got 'Other'"
+        ]
+
+    def test_in_optionals_and_unions(self):
+        assert problems(self.SHAPES + "fn f(c: Circle) { let s: Shape? = c; let u: Shape | int = c; }") == []
+
+    def test_function_types_take_wider_parameters(self):
+        # (a function taking a float goes where one taking an int is wanted
+        # (an int fits a float), not the other way round)
+        rules = make(
+            scope_options={"builtins": ("print", "len", "list", "map", "set", "each_int", "each_float")},
+            builtins={"print": "fn(...) -> void", "len": "fn(any) -> int", "each_int": "fn(fn(int) -> int) -> int", "each_float": "fn(fn(float) -> int) -> int"},
+        )
+        source = "fn on_float(x: float) -> int { return 1; } fn on_int(x: int) -> int { return 2; } "
+        assert problems(source + "let a = each_int(on_float);", rules) == []
+        assert messages(source + "let b = each_float(on_int);", rules) == ["argument 1 of each_float(): expected 'fn(float) -> int', got 'fn(int) -> int'"]
+
+    def test_a_generic_base(self):
+        source = "struct Box[T] { value: T; } struct IntBox : Box[int] { label: str; } let b = IntBox(1, \"x\"); let v: int = b.value; let w: Box[int] = b;"
+        assert problems(source) == []
+        assert messages(source.replace("let v: int", "let v: str")) == ["expected 'str', got 'int'"]
+
+    def test_a_cycle_of_bases_ends(self):
+        source = "struct A : B { x: int; } struct B : A { y: int; } fn f(a: A) { let n = a.z; let b: B = a; }"
+        assert "'A' has no field 'z'" in messages(source)
+
+
 class TestIndexing:
     def test_list(self):
         assert symbol_types('let xs = ["a"]; let v = xs[0];')["v"] == "str"
@@ -349,6 +501,18 @@ class TestProject:
         assert [d.code for d in project.file("main").diagnostics] == ["no-module"]
         # a name known not to be a type still is reported
         assert [d.code for d in RULES.check("let x = 1;\nlet y: x = 2;\n")] == ["unknown-type"]
+
+    def test_generics_and_bases_across_files(self):
+        lib = "struct Box[T] { value: T; }\nstruct Shape { name: str; }\nfn first[T](xs: list[T]) -> T { return xs[0]; }\n"
+        main = (
+            "from lib import Box, Shape, first;\nstruct Circle : Shape { r: float; }\n"
+            "let b: Box[str] = Box(\"s\");\nlet n: int = b.value;\nlet s: Shape = Circle(\"c\", 1.0);\nlet f: str = first([1]);\n"
+        )
+        project = RULES.analyze_project({"lib": lib, "main": main})
+        assert [(d.message, d.line) for d in project.file("main").diagnostics] == [
+            ("expected 'int', got 'str'", 4),
+            ("expected 'str', got 'int'", 6),
+        ]
 
     def test_types_cross_named_imports(self):
         project = RULES.analyze_project(

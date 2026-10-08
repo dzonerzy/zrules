@@ -129,11 +129,12 @@ Needs a `scopes()` rule in the same `Rules`. Its `basic` names become builtins o
 | `literals` | selector -> type: `{"Int": "int"}` |
 | `containers` | selector -> generic name, for literals whose `items` give the argument: `{"ListLit": "list"}` |
 | `type_names` | nodes whose text names a type |
-| `type_args` | generic types: children `base`, `args` |
+| `type_args` | generic types: children `base`, `args`; a `base` naming a declared generic type makes its instance (`Box[int]`), any other a built-in constructor by its name (`list[int]`) |
 | `optional` | nodes that make the type inside them optional |
+| `unions` | union types: children `members` (`int \| str`) |
 | `variables` | declarations: children `name`, `type`, `value` |
-| `functions` | children `name`, `params` (each a `variables` node or a bare name), `returns` |
-| `structs` | declared types: child `name`; the variables and functions in their scope are fields and methods |
+| `functions` | children `name`, `params` (each a `variables` node or a bare name), `returns`, `tparams` (type parameters: each a child `name` or a bare name) |
+| `structs` | declared types: child `name`; the variables and functions in their scope are fields and methods; `tparams` as a function's; `bases`, types it is one of (`struct B : A`) |
 | `binary` | children `left`, `op`, `right` |
 | `unary` | child `operand`; the operator is the `op` child, else the text before the operand |
 | `calls` | the callee is the child `callee`, else `name`, else `target`; arguments are the `args` children |
@@ -143,7 +144,7 @@ Needs a `scopes()` rule in the same `Rules`. Its `basic` names become builtins o
 | `conditions` | expressions that must be `bool` |
 | `operators` | operator text -> rows `(left, right, result)` or `(operand, result)`; `T` stands for one type throughout a row, `any` for anything |
 | `builtins` | name -> type text, for names in the `scopes()` rule's `builtins` |
-| `labels` | role -> label, to rename the children read: `name`, `type`, `value`, `params`, `returns`, `left`, `op`, `right`, `operand`, `callee`, `args`, `target`, `index`, `base`, `items` |
+| `labels` | role -> label, to rename the children read: `name`, `type`, `value`, `params`, `returns`, `left`, `op`, `right`, `operand`, `callee`, `args`, `target`, `index`, `base`, `items`, `tparams`, `bases`, `members` |
 | `namespace` | the `scopes()` rule to type (default: the first) |
 | `severity` | `"error"` (default), `"warning"` or `"note"`, for every type diagnostic |
 | `codes` | kind -> code |
@@ -151,9 +152,11 @@ Needs a `scopes()` rule in the same `Rules`. Its `basic` names become builtins o
 
 Kinds: `mismatch`, `operator`, `arity`, `argument`, `not_callable`, `no_field`, `bad_return`, `condition`, `unknown_type`, `not_indexable`.
 
-Type texts: `int`, `list[int]`, `map[str, int]`, `int?`, `fn(int, str) -> bool`, `fn(str, ...) -> void`, `fn(int)` (returns `void`), `unknown` / `any` (not checked). They nest at most 64 deep.
+Type texts: `int`, `list[int]`, `map[str, int]`, `int?`, `int | str`, `(int | str)?`, `fn(int, str) -> bool`, `fn(str, ...) -> void`, `fn(int)` (returns `void`), `unknown` / `any` (not checked). They nest at most 64 deep.
 
-Rules of compatibility: a type fits itself; `unknown` fits and is fitted by everything; `coerce` pairs fit one way, and chain (`int` -> `float` -> `number`); `T?` takes `T`, `nil` and optionals that fit; two generic types fit when their names are equal and each argument is the same or unknown on one side (`list[int]` does not fit `list[float]`, an empty list fits any list); a function type fits another with the same parameters (or unknown ones) and a result that fits.
+Rules of compatibility: a type fits itself; `unknown` fits and is fitted by everything; `coerce` pairs fit one way, and chain (`int` -> `float` -> `number`); `T?` takes `T`, `nil` and optionals that fit; a union fits where each of its members does, and a value fits a union if it fits one member (an optional: its inside and `nil`); a declared type fits its `bases` and theirs; two generic types (built-in or declared) fit when they are the same and each argument is the same or unknown on one side (`list[int]` does not fit `list[float]`, an empty list fits any list; a declared generic type written without arguments is any of its instances); a function type fits another whose parameters fit its own (a function taking a `float` goes where one taking an `int` is wanted) and whose result its result fits.
+
+Generics: a type parameter (`T` of `fn first[T](xs: list[T]) -> T`, of `struct Box[T]`) is a type of its own: inside, only `T` fits a `T`. A call of a generic function works out what its parameters stand for from the arguments, part by part (`list[T]` given a `list[int]`: `int`; a parameter seen twice takes the wider type), and checks the arguments and types the result accordingly; a parameter the arguments don't say is `unknown`. Calling a generic type makes the instance its fields' arguments say (`Box(5)` is a `Box[int]`); an instance's fields and methods have its arguments for its parameters. Unions: an operator applies to a union if it applies to each member (the results, a union); a field of a union is the field of every member (a missing one is reported). Bases: a declared type has its bases' fields (first, in a call of the type) and methods.
 
 ## flow()
 

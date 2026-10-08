@@ -215,6 +215,7 @@ fn types(args: pyoz.Args(struct {
     type_names: ?*PyObject = null,
     type_args: ?*PyObject = null,
     optional: ?*PyObject = null,
+    unions: ?*PyObject = null,
     variables: ?*PyObject = null,
     functions: ?*PyObject = null,
     structs: ?*PyObject = null,
@@ -238,6 +239,7 @@ fn types(args: pyoz.Args(struct {
     return .{ .value = makeRule(.types, .{
         .{ "basic", a.basic },           .{ "coerce", a.coerce },       .{ "literals", a.literals },
         .{ "type_names", a.type_names }, .{ "type_args", a.type_args }, .{ "optional", a.optional },
+        .{ "unions", a.unions },
         .{ "variables", a.variables },   .{ "functions", a.functions }, .{ "structs", a.structs },
         .{ "binary", a.binary },         .{ "unary", a.unary },         .{ "calls", a.calls },
         .{ "index", a.index },           .{ "assigns", a.assigns },     .{ "returns", a.returns },
@@ -333,6 +335,7 @@ const TypeRule = struct {
     type_names: []const Selector,
     type_args: []const Selector,
     optionals: []const Selector,
+    unions: []const Selector,
     variables: []const Selector,
     functions: []const Selector,
     structs: []const Selector,
@@ -1887,6 +1890,7 @@ const Rules = struct {
             .type_names = compileSelectors(state, py.c.PyDict_GetItemString(args, "type_names"), "type_names") orelse return null,
             .type_args = compileSelectors(state, py.c.PyDict_GetItemString(args, "type_args"), "type_args") orelse return null,
             .optionals = compileSelectors(state, py.c.PyDict_GetItemString(args, "optional"), "optional") orelse return null,
+            .unions = compileSelectors(state, py.c.PyDict_GetItemString(args, "unions"), "unions") orelse return null,
             .variables = compileSelectors(state, py.c.PyDict_GetItemString(args, "variables"), "variables") orelse return null,
             .functions = compileSelectors(state, py.c.PyDict_GetItemString(args, "functions"), "functions") orelse return null,
             .structs = compileSelectors(state, py.c.PyDict_GetItemString(args, "structs"), "structs") orelse return null,
@@ -2665,6 +2669,7 @@ const Rules = struct {
                 .type_names = try self.matchAll(tr.type_names),
                 .type_args = try self.matchAll(tr.type_args),
                 .optionals = try self.matchAll(tr.optionals),
+                .unions = try self.matchAll(tr.unions),
                 .variables = try self.matchAll(tr.variables),
                 .functions = try self.matchAll(tr.functions),
                 .structs = try self.matchAll(tr.structs),
@@ -3704,6 +3709,8 @@ const Rules = struct {
         // Every checker exists before any runs: they ask each other about
         // imported names. First, on this thread, what each file offers the
         // others; then every file checks its own code, in parallel.
+        // (every file's declared types' bases first: comparing types needs them)
+        for (checkers) |checker| checker.prepareBases() catch return oomObject() != null;
         for (checkers) |checker| checker.prepareExports() catch return oomObject() != null;
         if (!forEachFile(files.len, total_nodes, TypesJob{ .checkers = checkers })) return oomObject() != null;
 
@@ -3959,7 +3966,7 @@ pub const Module = pyoz.module(.{
         pyoz.func("count", count, "count(selector, exactly=None, min=None, max=None, message=None, code=None, severity=None): the number of matches within the node the selector's first part matched must be in range."),
         pyoz.func("scopes", scopes, "scopes(scope, define, use, define_outer=None, hoist=None, after=None, outside=None, builtins=None, ordered=True, namespace='name', on_undefined='error', on_redefine='error', on_unused='ignore', on_shadow='ignore', on_no_member='error', members=None, member_labels=('target', 'name'), imports=None, import_all=None, import_labels=('module', 'names', 'alias'), exports=None, on_no_module='error', on_no_export='error', on_unresolved=None, messages=None, codes=None): resolve names. `scope` nodes open a scope; `define` nodes define their text as a name in the scope around them (`define_outer`: in the scope outside that one); `use` nodes must resolve to a definition. `hoist` definitions are visible before their position; `after` definitions only once their parent node has ended. `members` nodes are accesses like a.b: the child labelled name is looked up in the scope that the child labelled target names."),
         pyoz.func("custom", custom, "custom(selector, function, code=None): call function(node, ctx) for every node matching `selector`."),
-        pyoz.func("types", types, "types(basic=None, coerce=None, literals=None, containers=None, names=None, type_names=None, type_args=None, optional=None, variables=None, functions=None, structs=None, binary=None, unary=None, calls=None, index=None, assigns=None, returns=None, conditions=None, operators=None, builtins=None, labels=None, namespace=None, severity='error', codes=None, ignore=None): type-check the program. Each option names the nodes that play a role (selectors), read through labelled children; see the documentation. Needs a scopes() rule for the names."),
+        pyoz.func("types", types, "types(basic=None, coerce=None, literals=None, containers=None, names=None, type_names=None, type_args=None, optional=None, unions=None, variables=None, functions=None, structs=None, binary=None, unary=None, calls=None, index=None, assigns=None, returns=None, conditions=None, operators=None, builtins=None, labels=None, namespace=None, severity='error', codes=None, ignore=None): type-check the program (generic functions and types through their `tparams`, unions, declared types' `bases`). Each option names the nodes that play a role (selectors), read through labelled children; see the documentation. Needs a scopes() rule for the names."),
         pyoz.func("flow", flow, "flow(sequences, functions=None, branches=None, arms=None, otherwise=None, loops=None, forever=None, at_least_once=None, exits=None, breaks=None, continues=None, gotos=None, targets=None, must_return=None, variables=None, assigns=None, labels=None, namespace=None, on_unreachable='warning', on_missing_return='error', on_unassigned='error', on_no_label='error', messages=None, codes=None): follow the control flow. Reports code that can't be reached, `must_return` functions whose end can be, and variables (declared by `variables` without a value, or defined by `assigns`) used before they have a value on every path. `gotos` jump to the nearest of the `targets` (labels) named as they are (child `name`) in their sequence or one around it, in their function; a jump to no label is reported."),
         pyoz.func("version", version, "Return the zrules version string"),
     },

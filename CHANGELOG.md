@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Generic functions and types** (`types()`, children `tparams` of `functions` and `structs`): `fn first[T](xs: list[T]) -> T`, `struct Box[T] { value: T; }`. A call works out the type parameters from its arguments, part by part, and types its result with them (`first([1])` is an `int`); a parameter it can't tell is `unknown`. `Box[int]` (a `type_args` whose base names the struct) is an instance; calling `Box` makes the one its arguments say; an instance's fields and methods have its arguments. Inside, a type parameter is a type of its own.
+- **Union types** (`types(unions=...)`, children `members`; `int | str` in type texts): a value fits a union if it fits a member, a union where every member does; operators and fields apply to unions member by member.
+- **Subtyping between declared types** (children `bases` of `structs`: `struct Circle : Shape`): a type fits its bases (through any chain), has their fields (first, when calling the type) and methods. Function types fit with parameters the other way round (a function taking a `float` goes where one taking an `int` is wanted).
+- examples/typed: type parameters, unions (a type written `A | B`, and in parentheses), bases.
 - **`flow(gotos=..., targets=...)`**: control flow that knows jumps to labels (Lua's `goto`). Code after a jump is unreachable up to a label a reachable jump goes to; variables follow the jumps, back ones too (the function walked again while a jump back brings something new). A jump goes to the nearest label of its name among the statements of its sequence or of one around it, in its function; one with no label is reported (`no_label`, `on_no_label=`). The label's name is the child `label` (the child `name` unless `labels=` says another). examples/lua uses them.
 
 ## [0.1.7] - 2026-10-07

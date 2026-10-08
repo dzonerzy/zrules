@@ -29,7 +29,8 @@ pub const Kind = enum {
     /// A named built-in type: `int`, `str`, `void`, ...
     basic,
     /// A type declared in the program (a struct, a class, an enum), by the
-    /// file and node that define it
+    /// file and node that define it; with `args`, a declared generic type
+    /// given its arguments (`Box[int]`)
     nominal,
     /// A constructor applied to types: `list[int]`, `map[str, int]`, and the
     /// two built-in ones: `?[T]` (optional, written `T?`) and `type[T]` (the
@@ -37,6 +38,13 @@ pub const Kind = enum {
     generic,
     /// `fn(A, B) -> R`
     function,
+    /// A type parameter of a generic function or type (`T` of `fn
+    /// first[T](xs: list[T]) -> T`), by the file and node that declare it:
+    /// the same type only as itself; a call works out what it stands for
+    param,
+    /// `A | B`: a value of one of `args` (two or more, sorted, no unions
+    /// among them)
+    @"union",
 };
 
 pub const Type = struct {
@@ -44,7 +52,8 @@ pub const Type = struct {
     name: []const u8 = "",
     file: u32 = NONE,
     node: u32 = NONE,
-    /// generic: its arguments. function: its parameters.
+    /// generic, nominal: its arguments. function: its parameters. union:
+    /// its members.
     args: []const TypeId = &.{},
     /// function: its result
     ret: TypeId = UNKNOWN,
@@ -171,6 +180,37 @@ pub const Table = struct {
         return self.intern(.{ .kind = .nominal, .name = name, .file = file, .node = node });
     }
 
+    /// A declared generic type given its arguments (`Box[int]`).
+    pub fn instance(self: *Table, of: TypeId, args: []const TypeId) !TypeId {
+        const t = self.get(of);
+        return self.intern(.{ .kind = .nominal, .name = t.name, .file = t.file, .node = t.node, .args = args });
+    }
+
+    pub fn param(self: *Table, name: []const u8, file: u32, node: u32) !TypeId {
+        return self.intern(.{ .kind = .param, .name = name, .file = file, .node = node });
+    }
+
+    /// `A | B | ...`: nested unions flattened, members sorted and once
+    /// each; one member is itself; any unknown member makes it unknown.
+    pub fn @"union"(self: *Table, alloc: Allocator, members: []const TypeId) !TypeId {
+        var flat: std.ArrayList(TypeId) = .empty;
+        for (members) |m| {
+            if (m == UNKNOWN) return UNKNOWN;
+            const t = self.get(m);
+            if (t.kind == .@"union") try flat.appendSlice(alloc, t.args) else try flat.append(alloc, m);
+        }
+        std.mem.sort(TypeId, flat.items, {}, std.sort.asc(TypeId));
+        var n: usize = 0;
+        for (flat.items) |m| {
+            if (n != 0 and flat.items[n - 1] == m) continue;
+            flat.items[n] = m;
+            n += 1;
+        }
+        if (n == 0) return UNKNOWN;
+        if (n == 1) return flat.items[0];
+        return self.intern(.{ .kind = .@"union", .args = flat.items[0..n] });
+    }
+
     pub fn generic(self: *Table, name: []const u8, args: []const TypeId) !TypeId {
         return self.intern(.{ .kind = .generic, .name = name, .args = args });
     }
@@ -185,16 +225,37 @@ pub const Table = struct {
         switch (t.kind) {
             .unknown => try out.appendSlice(a, "unknown"),
             .basic => try out.appendSlice(a, t.name),
-            .nominal => {
+            .nominal, .param => {
                 try out.appendSlice(a, t.name);
                 if (exact) {
                     var buf: [32]u8 = undefined;
                     try out.appendSlice(a, std.fmt.bufPrint(&buf, "#{d}:{d}", .{ t.file, t.node }) catch unreachable);
                 }
+                if (t.args.len != 0) {
+                    try out.append(a, '[');
+                    for (t.args, 0..) |arg, i| {
+                        if (i != 0) try out.appendSlice(a, ", ");
+                        try self.write(a, out, self.get(arg), exact);
+                    }
+                    try out.append(a, ']');
+                }
+            },
+            .@"union" => for (t.args, 0..) |arg, i| {
+                if (i != 0) try out.appendSlice(a, " | ");
+                const m = self.get(arg);
+                // (a function type in a union, parenthesized: its result
+                // would take the rest)
+                if (m.kind == .function) try out.append(a, '(');
+                try self.write(a, out, m, exact);
+                if (m.kind == .function) try out.append(a, ')');
             },
             .generic => {
                 if (std.mem.eql(u8, t.name, "?") and t.args.len == 1 and !exact) {
-                    try self.write(a, out, self.get(t.args[0]), exact);
+                    const inner = self.get(t.args[0]);
+                    const grouped = inner.kind == .@"union" or inner.kind == .function;
+                    if (grouped) try out.append(a, '(');
+                    try self.write(a, out, inner, exact);
+                    if (grouped) try out.append(a, ')');
                     return out.append(a, '?');
                 }
                 try out.appendSlice(a, t.name);
@@ -238,7 +299,7 @@ pub const Table = struct {
     /// checkers of a project prepare on several threads)
     pub fn parseIn(self: *Table, alloc: Allocator, text: []const u8) ParseError!TypeId {
         var p = Parser{ .table = self, .alloc = alloc, .text = text };
-        const id = try p.one();
+        const id = try p.alternatives();
         p.skip();
         if (p.pos != text.len) return error.BadType;
         return id;
@@ -262,9 +323,31 @@ pub const Table = struct {
             return true;
         }
 
+        /// `A | B | ...`, or one type
+        fn alternatives(self: *Parser) ParseError!TypeId {
+            const first = try self.one();
+            if (!self.eat("|")) return first;
+            var members: std.ArrayList(TypeId) = .empty;
+            try members.append(self.alloc, first);
+            while (true) {
+                try members.append(self.alloc, try self.one());
+                if (!self.eat("|")) break;
+            }
+            return self.table.@"union"(self.alloc, members.items);
+        }
+
         fn one(self: *Parser) ParseError!TypeId {
             self.skip();
             if (self.depth >= MAX_PARSE_DEPTH) return error.BadType;
+            // (a group: `(int | str)?`)
+            if (self.eat("(")) {
+                self.depth += 1;
+                defer self.depth -= 1;
+                var id = try self.alternatives();
+                if (!self.eat(")")) return error.BadType;
+                while (self.eat("?")) id = try self.table.generic("?", &.{id});
+                return id;
+            }
             self.depth += 1;
             defer self.depth -= 1;
             var id: TypeId = undefined;
@@ -277,7 +360,7 @@ pub const Table = struct {
                 var variadic = false;
                 if (!self.eat(")")) {
                     while (true) {
-                        if (self.eat("...")) variadic = true else try params.append(self.alloc, try self.one());
+                        if (self.eat("...")) variadic = true else try params.append(self.alloc, try self.alternatives());
                         if (self.eat(")")) break;
                         if (!self.eat(",")) return error.BadType;
                     }
@@ -287,7 +370,7 @@ pub const Table = struct {
             } else if (self.eat("[")) {
                 var args: std.ArrayList(TypeId) = .empty;
                 while (true) {
-                    try args.append(self.alloc, try self.one());
+                    try args.append(self.alloc, try self.alternatives());
                     if (self.eat("]")) break;
                     if (!self.eat(",")) return error.BadType;
                 }
@@ -319,6 +402,13 @@ pub const Labels = struct {
     index: u8 = 0,
     base: u8 = 0,
     items: u8 = 0,
+    /// A generic function's or type's type parameters (each: child `name`,
+    /// or its own text)
+    tparams: u8 = 0,
+    /// A declared type's base types (`struct B : A`): it is one of them
+    bases: u8 = 0,
+    /// A union type's members
+    members: u8 = 0,
 };
 
 /// One row of the operator table. `left`, `right` and `result` are types as
@@ -386,6 +476,8 @@ pub const Inputs = struct {
     type_names: []const u32 = &.{},
     type_args: []const u32 = &.{},
     optionals: []const u32 = &.{},
+    /// Union types (children `members`)
+    unions: []const u32 = &.{},
     /// Declarations of one name: child `name`, optional `type`, optional `value`
     variables: []const u32 = &.{},
     /// Child `name`, children `params`, optional `returns`
@@ -415,7 +507,7 @@ pub const Inputs = struct {
     uses: []const u32 = &.{},
 };
 
-const Role = enum(u8) { none, literal, container, binary, unary, call, index, member, type_name, type_args, optional };
+const Role = enum(u8) { none, literal, container, binary, unary, call, index, member, type_name, type_args, optional, union_type };
 
 /// One side of an operator row: a type, `T` (the same type throughout the
 /// row) or `any`
@@ -426,7 +518,21 @@ const Slot = struct {
 
 const Row = struct { left: Slot, right: Slot, result: Slot };
 
-const DeclKind = enum(u8) { none, variable, function, structure };
+const DeclKind = enum(u8) { none, variable, function, structure, type_param };
+
+/// What a generic call's type parameters stand for, worked out from its
+/// arguments (a parameter never seen: unknown)
+const Bindings = struct {
+    params: std.ArrayList(TypeId) = .empty,
+    types: std.ArrayList(TypeId) = .empty,
+
+    fn get(self: *const Bindings, p: TypeId) ?TypeId {
+        for (self.params.items, self.types.items) |q, t| {
+            if (q == p) return t;
+        }
+        return null;
+    }
+};
 
 /// The types a types() rule's options mention, as ids: the same for every
 /// file, so read once (interning takes the table's lock) and shared
@@ -568,6 +674,12 @@ pub const Checker = struct {
     /// Scope node -> the symbols of the variables declared directly in it
     fields_of: std.AutoHashMapUnmanaged(u32, std.ArrayList(u32)) = .empty,
     fields_grouped: bool = false,
+    /// A declared type's name node -> its base types (prepareBases: every
+    /// file's before any is checked, the others read them)
+    bases: std.AutoHashMapUnmanaged(u32, []const TypeId) = .empty,
+    /// Bases' fields being gathered (fieldTypes): a type among its own
+    /// bases ends there
+    fields_depth: u32 = 0,
     /// The computation in progress in this file (0 = none)
     frame: u64 = 0,
     /// The depth bookkeeping of the thread this checker works on: the
@@ -618,9 +730,15 @@ pub const Checker = struct {
         inline for (.{
             .{ "type_names", Role.type_name }, .{ "type_args", Role.type_args }, .{ "optionals", Role.optional },
             .{ "binaries", Role.binary },      .{ "unaries", Role.unary },       .{ "calls", Role.call },
-            .{ "indexes", Role.index },
+            .{ "indexes", Role.index },        .{ "unions", Role.union_type },
         }) |pair| {
             for (@field(self.in, pair[0])) |node| self.role[node] = pair[1];
+        }
+        // A generic type's base (`Box` of `Box[int]`) names what it applies,
+        // not a type of its own (`list` alone is no type)
+        for (self.in.type_args) |node| {
+            const base = self.child(node, self.in.labels.base);
+            if (base != NONE and self.role[base] == .type_name) self.role[base] = .none;
         }
         for (self.in.members, 0..) |m, i| {
             self.role[m.node] = .member;
@@ -638,6 +756,16 @@ pub const Checker = struct {
         for (self.in.structs) |node| {
             const name = self.child(node, self.in.labels.name);
             if (name != NONE) self.declare(name, .structure, node);
+        }
+        // A generic function's or type's parameters: types of their own
+        for ([_][]const u32{ self.in.functions, self.in.structs }) |decls| {
+            for (decls) |decl| {
+                var it = self.labelled(decl, self.in.labels.tparams);
+                while (it.next()) |tp| {
+                    const name = self.child(tp, self.in.labels.name);
+                    self.declare(if (name != NONE) name else tp, .type_param, tp);
+                }
+            }
         }
         // What the options say, read once for every file (see readOptions)
         self.coerce = opts.coerce;
@@ -869,7 +997,28 @@ pub const Checker = struct {
                 var args: TypeList = .{};
                 var it = self.labelled(node, self.in.labels.args);
                 while (it.next()) |arg| try args.append(self.arena, try self.typeNode(arg));
+                // A declared generic type given its arguments (`Box[int]`);
+                // else a built-in constructor, by its name (`list[int]`)
+                if (base != NONE) if (self.names.symbolOf(base)) |sym| {
+                    if (try self.namedType(sym, t.text(base))) |declared| {
+                        const d = self.table.get(declared);
+                        if (d.kind == .nominal) {
+                            const wanted = (try self.typeParamsOf(declared)).len;
+                            if (wanted != args.len) {
+                                try self.report(.arity, node, "'{s}' takes {d} type argument{s}, got {d}", .{ t.text(base), wanted, if (wanted == 1) "" else "s", args.len });
+                                return declared;
+                            }
+                            return self.table.instance(declared, args.items());
+                        }
+                    }
+                };
                 return self.table.generic(if (base != NONE) t.text(base) else "", args.items());
+            },
+            .union_type => {
+                var members: TypeList = .{};
+                var it = self.labelled(node, self.in.labels.members);
+                while (it.next()) |m| try members.append(self.arena, try self.typeNode(m));
+                return self.table.@"union"(self.arena, members.items());
             },
             .optional => {
                 const inner = node + 1;
@@ -940,8 +1089,35 @@ pub const Checker = struct {
                 const declared = try self.table.nominal(self.tree.text(name_node), self.file, name_node);
                 return self.table.generic("type", &.{declared});
             },
+            .type_param => {
+                const p = try self.table.param(self.tree.text(name_node), self.file, name_node);
+                return self.table.generic("type", &.{p});
+            },
             .none => return UNKNOWN,
         }
+    }
+
+    /// The type parameters of what `decl` declares (a generic function or
+    /// type), in order, in memory from `a` (the checker asking: another
+    /// file's is only read, it may be checking on another thread).
+    fn declaredParams(self: *const Checker, a: Allocator, decl: u32) Error![]const TypeId {
+        var out: std.ArrayList(TypeId) = .empty;
+        var it = self.labelled(decl, self.in.labels.tparams);
+        while (it.next()) |tp| {
+            const name = self.child(tp, self.in.labels.name);
+            const n = if (name != NONE) name else tp;
+            try out.append(a, try self.table.param(self.tree.text(n), self.file, n));
+        }
+        return out.items;
+    }
+
+    /// The type parameters of a declared type (its file's checker knows).
+    fn typeParamsOf(self: *Checker, declared: TypeId) Error![]const TypeId {
+        const d = self.table.get(declared);
+        if (d.kind != .nominal or d.file >= self.others.len) return &.{};
+        const home = self.others[d.file];
+        if (d.node >= home.decl_kind.len or home.decl_kind[d.node] != .structure) return &.{};
+        return home.declaredParams(self.arena, home.decl_node[d.node]);
     }
 
     fn functionType(self: *Checker, decl: u32) Error!TypeId {
@@ -959,7 +1135,8 @@ pub const Checker = struct {
         return if (annotation != NONE) self.typeNode(annotation) else UNKNOWN;
     }
 
-    /// The member `name` of a declared type, as (checker, symbol index).
+    /// The member `name` of a declared type itself (not its bases'), as
+    /// (checker, symbol index).
     fn memberOf(self: *Checker, owner: Type, name: []const u8) ?struct { *Checker, u32 } {
         if (owner.kind != .nominal or owner.file >= self.others.len) return null;
         const home = self.others[owner.file];
@@ -967,6 +1144,46 @@ pub const Checker = struct {
         const scope = home.names.symbols.items[sym].owns;
         if (scope == NONE) return null;
         return .{ home, home.names.lookup(scope, name) orelse return null };
+    }
+
+    /// The type of member `name` of a value of type `owner`: a declared
+    /// type's own (its parameters as the instance gives them), else its
+    /// bases' (nearest first); null if none has it.
+    fn fieldOf(self: *Checker, owner: TypeId, name: []const u8) Error!?TypeId {
+        var at = owner;
+        var steps: u32 = 0;
+        // (a chain of bases, breadth first; a cycle ends at the limit)
+        var queue: std.ArrayList(TypeId) = .empty;
+        try queue.append(self.arena, at);
+        var i: usize = 0;
+        while (i < queue.items.len and steps < MAX_DEPTH) : ({
+            i += 1;
+            steps += 1;
+        }) {
+            at = queue.items[i];
+            const o = self.table.get(at);
+            if (o.kind != .nominal) continue;
+            if (self.memberOf(o, name)) |found| {
+                const raw = try found[0].symbolType(found[1]);
+                if (try self.instanceBindings(at)) |b| return try self.substitute(raw, &b, 0);
+                return raw;
+            }
+            for (try self.basesOf(at)) |base| try queue.append(self.arena, base);
+        }
+        return null;
+    }
+
+    /// The base types of a declared type (`struct B : A`), as an instance
+    /// of it has them.
+    fn basesOf(self: *Checker, owner: TypeId) Error![]const TypeId {
+        const o = self.table.get(owner);
+        if (o.kind != .nominal or o.file >= self.others.len) return &.{};
+        const home = self.others[o.file];
+        const declared = home.bases.get(o.node) orelse return &.{};
+        const b = try self.instanceBindings(owner) orelse return declared;
+        const out = try self.arena.alloc(TypeId, declared.len);
+        for (out, declared) |*slot, d| slot.* = try self.substitute(d, &b, 0);
+        return out;
     }
 
     // ── Expressions ──
@@ -1059,14 +1276,23 @@ pub const Checker = struct {
                 // Already resolved by name (an enum's member, a module's)
                 if (self.names.symbolOf(node)) |sym| return self.symbolType(sym);
                 const owner_id = try self.typeOf(m.target);
-                var owner = self.table.get(owner_id);
-                if (owner.kind == .generic and std.mem.eql(u8, owner.name, "?") and owner.args.len == 1) owner = self.table.get(owner.args[0]);
-                if (owner.kind == .unknown) return UNKNOWN;
-                if (self.memberOf(owner, t.text(m.name))) |found| return found[0].symbolType(found[1]);
-                try self.report(.no_field, m.name, "'{s}' has no field '{s}'", .{ try self.show(owner_id), t.text(m.name) });
-                return UNKNOWN;
+                var inner = owner_id;
+                const o = self.table.get(owner_id);
+                if (o.kind == .generic and std.mem.eql(u8, o.name, "?") and o.args.len == 1) inner = o.args[0];
+                if (inner == UNKNOWN) return UNKNOWN;
+                // (a union's: every member's, the field's types together)
+                const each: []const TypeId = if (self.table.get(inner).kind == .@"union") self.table.get(inner).args else &.{inner};
+                var found_types: TypeList = .{};
+                for (each) |member_owner| {
+                    const got = try self.fieldOf(member_owner, t.text(m.name)) orelse {
+                        try self.report(.no_field, m.name, "'{s}' has no field '{s}'", .{ try self.show(owner_id), t.text(m.name) });
+                        return UNKNOWN;
+                    };
+                    try found_types.append(self.arena, got);
+                }
+                return self.table.@"union"(self.arena, found_types.items());
             },
-            .type_name, .type_args, .optional => return UNKNOWN,
+            .type_name, .type_args, .optional, .union_type => return UNKNOWN,
             .none => {},
         }
         // A name: the type of what it refers to
@@ -1098,12 +1324,9 @@ pub const Checker = struct {
         }
     }
 
-    fn operator(self: *Checker, node: u32, op: []const u8, l: TypeId, r: TypeId, unary: bool) Error!TypeId {
-        // An operator the table says nothing about is not judged
-        const entry = self.operators.get(op) orelse return UNKNOWN;
-        const rows = if (unary) entry.unary else entry.binary;
-        if (rows.len == 0) return UNKNOWN;
-        const common = if (unary) entry.common_unary else entry.common_binary;
+    /// What an operator's rows give for these operands, or null: no row
+    /// takes them.
+    fn applyRows(self: *const Checker, rows: []const Row, common: TypeId, l: TypeId, r: TypeId, unary: bool) ?TypeId {
         for (rows) |row| {
             var bound: TypeId = UNKNOWN;
             if (!unary and !self.accepts(row.left, l, &bound)) continue;
@@ -1115,6 +1338,33 @@ pub const Checker = struct {
                 .exact => row.result.id,
                 .any => UNKNOWN,
             };
+        }
+        return null;
+    }
+
+    fn operator(self: *Checker, node: u32, op: []const u8, l: TypeId, r: TypeId, unary: bool) Error!TypeId {
+        // An operator the table says nothing about is not judged
+        const entry = self.operators.get(op) orelse return UNKNOWN;
+        const rows = if (unary) entry.unary else entry.binary;
+        if (rows.len == 0) return UNKNOWN;
+        const common = if (unary) entry.common_unary else entry.common_binary;
+        // (a union operand: each of its members must be one the operator
+        // takes, the results together; `T == T` rows compare the operands
+        // as they are)
+        const lu = self.table.get(l);
+        const ru = self.table.get(r);
+        const split = (!unary and lu.kind == .@"union") or ru.kind == .@"union";
+        if (!split) {
+            if (self.applyRows(rows, common, l, r, unary)) |result| return result;
+        } else union_case: {
+            if (self.applyRows(rows, common, l, r, unary)) |result| return result;
+            const lefts: []const TypeId = if (!unary and lu.kind == .@"union") lu.args else &.{l};
+            const rights: []const TypeId = if (ru.kind == .@"union") ru.args else &.{r};
+            var results: TypeList = .{};
+            for (lefts) |a| for (rights) |b| {
+                try results.append(self.arena, self.applyRows(rows, common, a, b, unary) orelse break :union_case);
+            };
+            return self.table.@"union"(self.arena, results.items());
         }
         if (unary) {
             try self.report(.operator, node, "operator '{s}' cannot be applied to '{s}'", .{ op, try self.show(r) });
@@ -1139,28 +1389,66 @@ pub const Checker = struct {
         const ct = self.table.get(callee_id);
         const name = t.text(callee);
         switch (ct.kind) {
-            .unknown => return UNKNOWN,
+            .unknown, .@"union" => return UNKNOWN,
             .function => {
-                if (ct.variadic and args.len >= ct.args.len) {
-                    try self.checkArguments(name, args[0..ct.args.len], arg_types[0..ct.args.len], ct.args);
-                    return ct.ret;
+                // A generic function: its type parameters are what the
+                // arguments say (part by part), in the parameters and the
+                // result alike; one they don't say is unknown
+                var wanted = ct.args;
+                var ret = ct.ret;
+                var params: std.ArrayList(TypeId) = .empty;
+                try self.paramsIn(callee_id, &params, 0);
+                if (params.items.len != 0) {
+                    var b = try self.bindingsOf(params.items);
+                    for (ct.args, 0..) |w, i| {
+                        if (i < arg_types.len) self.bind(w, arg_types[i], &b, 0);
+                    }
+                    const out = try self.arena.alloc(TypeId, ct.args.len);
+                    for (out, ct.args) |*slot, w| slot.* = try self.substitute(w, &b, 0);
+                    wanted = out;
+                    ret = try self.substitute(ct.ret, &b, 0);
                 }
-                if (args.len != ct.args.len) {
-                    try self.report(.arity, node, "{s}() takes {d} argument{s}, got {d}", .{ name, ct.args.len, if (ct.args.len == 1) "" else "s", args.len });
-                    return ct.ret;
+                if (ct.variadic and args.len >= wanted.len) {
+                    try self.checkArguments(name, args[0..wanted.len], arg_types[0..wanted.len], wanted);
+                    return ret;
                 }
-                try self.checkArguments(name, args, arg_types, ct.args);
-                return ct.ret;
+                if (args.len != wanted.len) {
+                    try self.report(.arity, node, "{s}() takes {d} argument{s}, got {d}", .{ name, wanted.len, if (wanted.len == 1) "" else "s", args.len });
+                    return ret;
+                }
+                try self.checkArguments(name, args, arg_types, wanted);
+                return ret;
             },
             .generic => if (std.mem.eql(u8, ct.name, "type") and ct.args.len == 1) {
-                // Calling a declared type constructs it: one argument per field
+                // Calling a declared type constructs it: one argument per
+                // field (its bases' first); a generic one is the instance
+                // its arguments say (`Box(5)`: a `Box[int]`)
                 const made = self.table.get(ct.args[0]);
                 if (made.kind == .nominal and made.file < self.others.len) {
                     const home = self.others[made.file];
-                    const fields = try home.fieldTypes(made.node);
+                    var fields = try home.fieldTypes(made.node);
+                    var result = ct.args[0];
+                    if (made.args.len == 0) {
+                        const params = try self.typeParamsOf(ct.args[0]);
+                        if (params.len != 0) {
+                            var b = try self.bindingsOf(params);
+                            for (fields, 0..) |w, i| {
+                                if (i < arg_types.len) self.bind(w, arg_types[i], &b, 0);
+                            }
+                            const out = try self.arena.alloc(TypeId, fields.len);
+                            for (out, fields) |*slot, w| slot.* = try self.substitute(w, &b, 0);
+                            fields = out;
+                            result = try self.table.instance(ct.args[0], b.types.items);
+                        }
+                    } else if (try self.instanceBindings(ct.args[0])) |b| {
+                        const out = try self.arena.alloc(TypeId, fields.len);
+                        for (out, fields) |*slot, w| slot.* = try self.substitute(w, &b, 0);
+                        fields = out;
+                    }
                     if (fields.len != args.len) {
                         try self.report(.arity, node, "{s}() takes {d} argument{s}, got {d}", .{ name, fields.len, if (fields.len == 1) "" else "s", args.len });
                     } else try self.checkArguments(name, args, arg_types, fields);
+                    return result;
                 }
                 return ct.args[0];
             },
@@ -1168,6 +1456,112 @@ pub const Checker = struct {
         }
         try self.report(.not_callable, callee, "'{s}' is not callable: it is '{s}'", .{ name, try self.show(callee_id) });
         return UNKNOWN;
+    }
+
+    // ── Generics ──
+
+    /// The type parameters `id` mentions (each once), added to `out`.
+    fn paramsIn(self: *Checker, id: TypeId, out: *std.ArrayList(TypeId), depth: u32) Error!void {
+        if (depth > MAX_PARSE_DEPTH) return;
+        const t = self.table.get(id);
+        switch (t.kind) {
+            .param => if (std.mem.indexOfScalar(TypeId, out.items, id) == null) try out.append(self.arena, id),
+            .generic, .nominal, .@"union", .function => {
+                for (t.args) |a| try self.paramsIn(a, out, depth + 1);
+                if (t.kind == .function) try self.paramsIn(t.ret, out, depth + 1);
+            },
+            else => {},
+        }
+    }
+
+    /// `id` with the type parameters `b` binds replaced (the others kept).
+    fn substitute(self: *Checker, id: TypeId, b: *const Bindings, depth: u32) Error!TypeId {
+        if (depth > MAX_PARSE_DEPTH) return id;
+        const t = self.table.get(id);
+        switch (t.kind) {
+            .param => return b.get(id) orelse id,
+            .generic, .nominal, .@"union", .function => {
+                if (t.args.len == 0 and t.kind != .function) return id;
+                var changed = false;
+                const args = try self.arena.alloc(TypeId, t.args.len);
+                for (args, t.args) |*slot, a| {
+                    slot.* = try self.substitute(a, b, depth + 1);
+                    if (slot.* != a) changed = true;
+                }
+                var ret = t.ret;
+                if (t.kind == .function) {
+                    ret = try self.substitute(t.ret, b, depth + 1);
+                    if (ret != t.ret) changed = true;
+                }
+                if (!changed) return id;
+                return switch (t.kind) {
+                    .generic => self.table.generic(t.name, args),
+                    .nominal => self.table.intern(.{ .kind = .nominal, .name = t.name, .file = t.file, .node = t.node, .args = args }),
+                    .@"union" => self.table.@"union"(self.arena, args),
+                    .function => self.table.function(args, ret, t.variadic),
+                    else => unreachable,
+                };
+            },
+            else => return id,
+        }
+    }
+
+    /// What `got` (an argument's type) says the type parameters of `want`
+    /// (a parameter's type) stand for: matched part by part. A parameter
+    /// seen twice takes the wider (an int, then a float: float); one whose
+    /// arguments disagree keeps the first (the argument check says so).
+    fn bind(self: *const Checker, want: TypeId, got: TypeId, b: *Bindings, depth: u32) void {
+        if (got == UNKNOWN or depth > MAX_PARSE_DEPTH) return;
+        const w = self.table.get(want);
+        const g = self.table.get(got);
+        switch (w.kind) {
+            .param => {
+                const i = std.mem.indexOfScalar(TypeId, b.params.items, want) orelse return;
+                const cur = b.types.items[i];
+                if (cur == UNKNOWN or self.assignable(cur, got)) b.types.items[i] = got;
+            },
+            .generic => {
+                // (an optional parameter takes a value: what's inside is it)
+                if (std.mem.eql(u8, w.name, "?") and w.args.len == 1 and !(g.kind == .generic and std.mem.eql(u8, g.name, "?"))) {
+                    if (got != self.nil_type) self.bind(w.args[0], got, b, depth + 1);
+                    return;
+                }
+                if (g.kind != .generic or !std.mem.eql(u8, g.name, w.name) or g.args.len != w.args.len) return;
+                for (w.args, g.args) |x, y| self.bind(x, y, b, depth + 1);
+            },
+            .nominal => {
+                if (g.kind != .nominal or g.node != w.node or g.file != w.file or g.args.len != w.args.len) return;
+                for (w.args, g.args) |x, y| self.bind(x, y, b, depth + 1);
+            },
+            .function => {
+                if (g.kind != .function or g.args.len != w.args.len) return;
+                for (w.args, g.args) |x, y| self.bind(x, y, b, depth + 1);
+                self.bind(w.ret, g.ret, b, depth + 1);
+            },
+            else => {},
+        }
+    }
+
+    /// Bindings of `params`, none known yet.
+    fn bindingsOf(self: *Checker, params: []const TypeId) Error!Bindings {
+        var b = Bindings{};
+        try b.params.appendSlice(self.arena, params);
+        try b.types.appendNTimes(self.arena, UNKNOWN, params.len);
+        return b;
+    }
+
+    /// A declared type's members as an instance has them: its parameters
+    /// replaced by the instance's arguments (none given: unknown).
+    fn instanceBindings(self: *Checker, owner: TypeId) Error!?Bindings {
+        const o = self.table.get(owner);
+        if (o.kind != .nominal) return null;
+        const params = try self.typeParamsOf(owner);
+        if (params.len == 0) return null;
+        const b = try self.bindingsOf(params);
+        for (b.types.items, 0..) |*slot, i| {
+            if (i < o.args.len) slot.* = o.args[i];
+        }
+        return b;
     }
 
     fn checkArguments(self: *Checker, name: []const u8, args: []const u32, got: []const TypeId, wanted: []const TypeId) Error!void {
@@ -1195,11 +1589,42 @@ pub const Checker = struct {
             }
         }
         const mark = self.work.overflows;
+        // (a base's fields first, as the base's instance has them)
+        if (self.bases.get(name_node)) |bases| {
+            if (self.fields_depth < 32) {
+                self.fields_depth += 1;
+                defer self.fields_depth -= 1;
+                for (bases) |base| {
+                    const bt = self.table.get(base);
+                    if (bt.kind != .nominal or bt.file >= self.others.len) continue;
+                    const inherited = try self.others[bt.file].fieldTypes(bt.node);
+                    const b = try self.instanceBindings(base);
+                    for (inherited) |f| try out.append(self.arena, if (b) |bb| try self.substitute(f, &bb, 0) else f);
+                }
+            }
+        }
         if (self.fields_of.get(scope)) |fields| {
             for (fields.items) |i| try out.append(self.arena, try self.symbolType(i));
         }
         if (self.work.overflows == mark) try self.field_types.put(self.arena, scope, out.items);
         return out.items;
+    }
+
+    /// The base types of every declared type of this file (`struct B : A`):
+    /// before any file is checked, as types are compared everywhere.
+    pub fn prepareBases(self: *Checker) Error!void {
+        if (self.in.labels.bases == 0) return;
+        for (self.in.structs) |decl| {
+            const name = self.child(decl, self.in.labels.name);
+            if (name == NONE) continue;
+            var list: TypeList = .{};
+            var it = self.labelled(decl, self.in.labels.bases);
+            while (it.next()) |b| {
+                const id = try self.settled(.type_node, b);
+                if (self.table.get(id).kind == .nominal) try list.append(self.arena, id);
+            }
+            if (list.items().len != 0) try self.bases.put(self.arena, name, try self.arena.dupe(TypeId, list.items()));
+        }
     }
 
     // ── Compatibility ──
@@ -1215,10 +1640,25 @@ pub const Checker = struct {
         if (from == to or from == UNKNOWN or to == UNKNOWN) return true;
         const f = self.table.get(from);
         const t = self.table.get(to);
+        // A union fits where each of its members does; a value fits a union
+        // if it fits one of the members (an optional: its inside and nil)
+        if (f.kind == .@"union") {
+            for (f.args) |m| {
+                if (!self.fits(m, to, steps)) return false;
+            }
+            return true;
+        }
+        if (t.kind == .@"union") {
+            if (isOptional(f)) return self.fits(f.args[0], to, steps) and self.fits(self.nil_type, to, steps);
+            for (t.args) |m| {
+                if (self.fits(from, m, steps)) return true;
+            }
+            return false;
+        }
         // T? takes nil, a T, or another optional whose inside fits
-        if (t.kind == .generic and std.mem.eql(u8, t.name, "?") and t.args.len == 1) {
+        if (isOptional(t)) {
             if (from == self.nil_type) return true;
-            if (f.kind == .generic and std.mem.eql(u8, f.name, "?") and f.args.len == 1) return self.fits(f.args[0], t.args[0], steps);
+            if (isOptional(f)) return self.fits(f.args[0], t.args[0], steps);
             return self.fits(from, t.args[0], steps);
         }
         if (steps < self.coerce.items.len) {
@@ -1226,25 +1666,61 @@ pub const Checker = struct {
                 if (pair[0] == from and (pair[1] == to or self.fits(pair[1], to, steps + 1))) return true;
             }
         }
+        // A declared type fits its bases, and theirs (`struct B : A`)
+        if (f.kind == .nominal and t.kind == .nominal and !(f.node == t.node and f.file == t.file)) return self.isSubtype(f, t, 0);
         if (f.kind != t.kind) return false;
         switch (f.kind) {
-            .generic => {
-                // list[unknown] fits list[int]; otherwise arguments must be the same
-                if (!std.mem.eql(u8, f.name, t.name) or f.args.len != t.args.len) return false;
+            .generic, .nominal => {
+                // list[unknown] fits list[int]; otherwise arguments must be
+                // the same (a declared generic type written without them,
+                // `Box`, is any of its instances)
+                if (!std.mem.eql(u8, f.name, t.name)) return false;
+                if (f.kind == .nominal and (f.args.len == 0 or t.args.len == 0)) return true;
+                if (f.args.len != t.args.len) return false;
                 for (f.args, t.args) |a, b| {
                     if (a != b and a != UNKNOWN and b != UNKNOWN) return false;
                 }
                 return true;
             },
             .function => {
+                // (where a function taking an A is wanted, one taking what
+                // an A fits in goes too: parameters the other way round)
                 if (f.args.len != t.args.len or f.variadic != t.variadic) return false;
                 for (f.args, t.args) |a, b| {
-                    if (a != b and a != UNKNOWN and b != UNKNOWN) return false;
+                    if (!self.fits(b, a, steps)) return false;
                 }
                 return self.fits(f.ret, t.ret, steps);
             },
             else => return false,
         }
+    }
+
+    fn isOptional(t: Type) bool {
+        return t.kind == .generic and std.mem.eql(u8, t.name, "?") and t.args.len == 1;
+    }
+
+    /// Is declared type `f` one of `t`'s kind through its bases (theirs
+    /// too)? A base is compared as written in the declaration: an
+    /// instance's arguments aren't put in its bases here (comparing makes no
+    /// types). A cycle of bases ends at the depth limit.
+    fn isSubtype(self: *const Checker, f: Type, t: Type, depth: u32) bool {
+        if (depth > 32 or f.file >= self.others.len) return false;
+        const bases = self.others[f.file].bases.get(f.node) orelse return false;
+        for (bases) |base| {
+            const b = self.table.get(base);
+            if (b.kind != .nominal) continue;
+            if (b.node == t.node and b.file == t.file) {
+                if (b.args.len == 0 or t.args.len == 0) return true;
+                if (b.args.len != t.args.len) continue;
+                const same = for (b.args, t.args) |x, y| {
+                    if (x != y and x != UNKNOWN and y != UNKNOWN) break false;
+                } else true;
+                if (same) return true;
+                continue;
+            }
+            if (self.isSubtype(b, t, depth + 1)) return true;
+        }
+        return false;
     }
 
     // ── The checks ──
@@ -1322,9 +1798,13 @@ pub const Checker = struct {
             for (@field(self.in, list)) |node| _ = try self.settled(.expr, node);
         }
         for (self.in.members) |m| _ = try self.settled(.expr, m.node);
-        // Types written anywhere else (each is evaluated, and reported, once)
-        inline for (.{ "type_names", "type_args", "optionals" }) |list| {
-            for (@field(self.in, list)) |node| _ = try self.settled(.type_node, node);
+        // Types written anywhere else (each is evaluated, and reported, once;
+        // not a generic type's base, which is its type_args')
+        inline for (.{ "type_names", "type_args", "optionals", "unions" }) |list| {
+            for (@field(self.in, list)) |node| {
+                if (self.role[node] == .none) continue;
+                _ = try self.settled(.type_node, node);
+            }
         }
     }
 
@@ -1340,7 +1820,7 @@ pub const Checker = struct {
             node -= 1;
             if (self.expr[node] != UNSET) continue;
             const role = self.role[node];
-            if (role == .type_name or role == .type_args or role == .optional) continue;
+            if (role == .type_name or role == .type_args or role == .optional or role == .union_type) continue;
             // Most nodes are no expression at all: what compute() would
             // conclude, without the bookkeeping
             if (role == .none and self.names.symbolOf(node) == null) {

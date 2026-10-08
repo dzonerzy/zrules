@@ -382,6 +382,8 @@ flow(
     exits="Return, Throw",                 # nothing runs after these
     breaks="Break",
     continues="Continue",
+    gotos="Goto",                          # jumps to a label: child `label` (or `name`)
+    targets="Label",                       # the labels, statements of a sequence
     must_return="FuncDef:has(> .returns)", # functions whose end must not be reachable
     variables="Let",                       # declarations: children `name`, `value`
     assigns="Assign",                      # assignments: child `target`
@@ -396,6 +398,7 @@ Only `sequences` is required; every other option adds to what is understood.
 - **Branches.** The arms of a branch are its child sequences, or what `arms=` selects; everything else in it (the condition) always runs. A branch covers every case only if one of its arms is an `otherwise` arm, or a nested branch (`else if`). Without one, the path that takes no arm counts too.
 - **Loops.** The body of a loop is its first child sequence; what comes before it (the condition) runs at least once, what comes after it (the step of a `for`, the condition of a `do ... while`) after each iteration. What a loop body gives a value to may not have one after the loop, unless the loop is `at_least_once`.
 - **Functions** are separate: a use inside a nested function of a variable of the enclosing one is not judged (when the nested function runs is not known), and a variable that another function assigns is not followed at all.
+- **`goto`.** A jump continues at its label, forward or back (a back jump is a loop): what follows the label is reachable through it, and what a variable has there is what every path to it gives it. A jump is matched to a label of its function's sequences that contain it, innermost first; one with no label there is reported (`no-label`).
 - **`exits`** can be any node, not just a statement: `exits="Return, Call[callee=exit]"` makes a call of `exit()` end the path.
 
 `labels={"target": "lhs"}` renames the children read (`name`, `value`, `target`); `on_unreachable`, `on_missing_return` and `on_unassigned` are `"error"`, `"warning"` or `"ignore"`; `messages=` and `codes=` take the keys `unreachable`, `missing_return`, `unassigned` and `maybe_unassigned`. Control structures nested more than 256 deep are not looked into.
@@ -519,7 +522,7 @@ Key implementation details:
 ## Known Issues
 
 - Every check is a whole-file check: there is no incremental mode. At about 0.06 ms per thousand nodes with names, types and flow, checking again after every change is cheap.
-- `flow()` does not look into control structures nested more than 256 deep; `goto` and labels are not followed.
+- `flow()` does not look into control structures nested more than 256 deep.
 - Input nested too deeply for zgram to parse is a `zgram.ParseError`, before zrules sees it.
 
 ## Project Structure

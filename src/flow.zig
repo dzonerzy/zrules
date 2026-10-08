@@ -23,7 +23,13 @@ const NONE = tree_mod.NONE;
 /// recurses, and must not run out of stack on a pathological input.
 pub const MAX_DEPTH = 256;
 
-pub const ProblemKind = enum { dead, missing_return, unassigned, maybe_unassigned };
+pub const ProblemKind = enum { dead, missing_return, unassigned, maybe_unassigned, no_label };
+
+/// A `goto`'s passes: a function with labels is walked again while a
+/// `goto` back to a label already passed brings it something new (paths
+/// that reach it, variables without a value on them); at most this many
+/// times (each pass only removes values: few are needed)
+const MAX_PASSES = 8;
 
 pub const Problem = struct {
     kind: ProblemKind,
@@ -34,6 +40,9 @@ pub const Labels = struct {
     name: u8 = 0,
     value: u8 = 0,
     target: u8 = 0,
+    /// The child of a jump and of a label naming the label (field `name`
+    /// unless given)
+    label: u8 = 0,
 };
 
 /// What the caller matched (node lists in source order)
@@ -59,6 +68,13 @@ pub const Inputs = struct {
     exits: []const u32 = &.{},
     breaks: []const u32 = &.{},
     continues: []const u32 = &.{},
+    /// Jumps to a label (`goto name`: child `name`), which the walk goes
+    /// on from: the nearest label of that name in the jump's sequence or
+    /// one around it, in the same function
+    gotos: []const u32 = &.{},
+    /// Labels (`::name::`: child `name`): reached by what comes before and
+    /// by the jumps to them
+    targets: []const u32 = &.{},
     /// Functions whose end must not be reachable
     must_return: []const u32 = &.{},
 
@@ -73,7 +89,17 @@ pub const Inputs = struct {
     assigns: []const u32 = &.{},
 };
 
-const Kind = enum(u8) { plain, sequence, function, branch, loop, exit, brk, cont };
+const Kind = enum(u8) { plain, sequence, function, branch, loop, exit, brk, cont, jump, target };
+
+/// A label's paths in the pass of its function: what the jumps to it bring
+/// (`entry`: their states met), kept between passes
+const LabelPaths = struct {
+    entry: State,
+    /// The walk got to the label in this pass (a jump after that brings
+    /// what this pass didn't see: `grew`)
+    visited: bool = false,
+    grew: bool = false,
+};
 
 const Flags = packed struct(u8) {
     arm: bool = false,
@@ -144,6 +170,12 @@ pub const Analysis = struct {
     levels_in_use: usize = 0,
     /// The storage of states with no variables to follow
     no_words: [1]usize = .{0},
+    /// Per jump: its label (NONE: none of that name visible)
+    jump_to: []u32 = &.{},
+    /// Per label: its LabelPaths (made when its function is walked), or null
+    target_of: []?*LabelPaths = &.{},
+    /// Function (NONE = the top level) -> its labels
+    labels_of: std.AutoHashMapUnmanaged(u32, std.ArrayList(u32)) = .empty,
 
     const Error = Allocator.Error;
 
@@ -171,6 +203,8 @@ pub const Analysis = struct {
             self.kind[node] = .loop;
             self.flags[node].once = true;
         }
+        for (self.in.gotos) |node| self.kind[node] = .jump;
+        for (self.in.targets) |node| self.kind[node] = .target;
         for (self.in.functions) |node| self.kind[node] = .function;
         for (self.in.must_return) |node| self.flags[node].must_return = true;
         self.arms_given = self.in.arms.len != 0;
@@ -181,10 +215,55 @@ pub const Analysis = struct {
         }
 
         try self.prepareVariables();
+        try self.prepareJumps();
 
-        var flow = try self.enter(NONE);
-        var state = try self.fresh(&flow, true);
-        try self.walk(0, &state, &flow);
+        try self.functionFlow(NONE);
+    }
+
+    /// Each jump's label: the nearest label of its name in a sequence it is
+    /// in (its own, then the ones around it), not past the function it is
+    /// in. A jump to no label is reported.
+    fn prepareJumps(self: *Analysis) Error!void {
+        if (self.in.gotos.len == 0 and self.in.targets.len == 0) return;
+        const t = self.tree;
+        const n = t.nodes.len;
+        self.jump_to = try self.arena.alloc(u32, n);
+        @memset(self.jump_to, NONE);
+        self.target_of = try self.arena.alloc(?*LabelPaths, n);
+        @memset(self.target_of, null);
+        const name_field = self.in.labels.label;
+        for (self.in.targets) |label| {
+            var at = t.parents[label];
+            while (at != NONE and self.kind[at] != .function) at = t.parents[at];
+            const e = try self.labels_of.getOrPut(self.arena, at);
+            if (!e.found_existing) e.value_ptr.* = .empty;
+            try e.value_ptr.append(self.arena, label);
+        }
+        for (self.in.gotos) |jump| {
+            const name = self.nameText(jump, name_field);
+            var at = t.parents[jump];
+            const found = search: while (at != NONE) : (at = t.parents[at]) {
+                if (self.kind[at] == .function) break :search NONE;
+                if (self.kind[at] != .sequence) continue;
+                // (a label among the sequence's own statements)
+                const stop = t.end(at);
+                var c = at + 1;
+                while (c < stop) : (c = t.end(c)) {
+                    if (self.kind[c] == .target and std.mem.eql(u8, self.nameText(c, name_field), name)) break :search c;
+                }
+            } else NONE;
+            self.jump_to[jump] = found;
+            if (found == NONE) {
+                const named = self.child(jump, name_field);
+                try self.report(.no_label, if (named != NONE) named else jump);
+            }
+        }
+    }
+
+    /// The text that names a jump or a label: its child `name`, or its own.
+    fn nameText(self: *const Analysis, node: u32, field: u8) []const u8 {
+        const named = self.child(node, field);
+        return self.tree.text(if (named != NONE) named else node);
     }
 
     /// The flow of a function (or the top level), at the next nesting depth.
@@ -483,7 +562,39 @@ pub const Analysis = struct {
                 if (flow.loop) |l| meet(&l.continues, state.*);
                 state.live = false;
             },
+            .jump => {
+                try self.scan(node, state, flow);
+                const label = if (self.jump_to.len != 0) self.jump_to[node] else NONE;
+                if (state.live and label != NONE) if (self.target_of[label]) |target| {
+                    // (a jump back to a label this pass went past: what it
+                    // brings is for the next pass)
+                    if (target.visited and grows(target.entry, state.*)) target.grew = true;
+                    meet(&target.entry, state.*);
+                };
+                state.live = false;
+            },
+            .target => {
+                try self.scan(node, state, flow);
+                if (self.target_of[node]) |target| {
+                    meet(state, target.entry);
+                    target.visited = true;
+                }
+            },
         }
+    }
+
+    /// Would meeting `from` into `into` change it: a path that gets there,
+    /// or a variable without a value on one?
+    fn grows(into: State, from: State) bool {
+        for (into.some, from.some) |a, b| {
+            if (b & ~a != 0) return true;
+        }
+        if (!from.live) return false;
+        if (!into.live) return true;
+        for (into.all, from.all) |a, b| {
+            if (a & ~b != 0) return true;
+        }
+        return false;
     }
 
     /// A node that is no control structure: what is inside it happens in
@@ -533,12 +644,15 @@ pub const Analysis = struct {
         var c = node + 1;
         while (c < stop) : (c = t.end(c)) {
             if (flow.level.pending.items.len != 0) settle(flow, state, c);
-            // A function written after a `return` is still a definition
-            if (!state.live and !reported and self.kind[c] != .function) {
+            // A function written after a `return` is still a definition; a
+            // label is where jumps go, not code
+            if (!state.live and !reported and self.kind[c] != .function and self.kind[c] != .target) {
                 try self.report(.dead, c);
                 reported = true;
             }
             try self.walk(c, state, flow);
+            // (reached again through a label: code dead after it is said again)
+            if (state.live) reported = false;
         }
         if (flow.level.pending.items.len != 0) settle(flow, state, stop);
     }
@@ -615,15 +729,53 @@ pub const Analysis = struct {
         state.* = out;
     }
 
-    /// A function: a flow of its own, starting with nothing given a value.
+    /// A function (or the top level, NONE): a flow of its own, starting
+    /// with nothing given a value. With labels, walked again while a jump
+    /// back to a label brings it what the pass didn't see (MAX_PASSES);
+    /// what the last pass found is what's reported.
     fn functionFlow(self: *Analysis, node: u32) Error!void {
         var flow = try self.enter(node);
         defer self.leave();
-        var state = try self.fresh(&flow, true);
-        try self.scan(node, &state, &flow);
-        if (self.flags[node].must_return and state.live) {
-            const name = self.child(node, self.in.labels.name);
-            try self.report(.missing_return, if (name != NONE) name else node);
+        const labels: []const u32 = if (self.labels_of.get(node)) |l| l.items else &.{};
+        for (labels) |label| {
+            const target = try self.arena.create(LabelPaths);
+            target.* = .{ .entry = try self.lasting(&flow) };
+            self.target_of[label] = target;
         }
+        var pass: usize = 0;
+        while (true) : (pass += 1) {
+            const mark = self.problems.items.len;
+            for (labels) |label| {
+                self.target_of[label].?.visited = false;
+                self.target_of[label].?.grew = false;
+            }
+            flow.reported = &.{};
+            flow.level.pending.clearRetainingCapacity();
+            var state = try self.fresh(&flow, true);
+            if (node == NONE) try self.walk(0, &state, &flow) else try self.scan(node, &state, &flow);
+            const again = for (labels) |label| {
+                if (self.target_of[label].?.grew) break true;
+            } else false;
+            if (!again or pass + 1 >= MAX_PASSES) {
+                if (node != NONE and self.flags[node].must_return and state.live) {
+                    const name = self.child(node, self.in.labels.name);
+                    try self.report(.missing_return, if (name != NONE) name else node);
+                }
+                return;
+            }
+            self.problems.shrinkRetainingCapacity(mark);
+            try self.release(&flow, state);
+        }
+    }
+
+    /// A state kept across a function's passes (a label's entry): not one
+    /// of the buffers given back and reused.
+    fn lasting(self: *Analysis, flow: *const Flow) Error!State {
+        if (flow.words == 0) return .{ .live = false, .all = self.no_words[0..0], .some = self.no_words[0..0] };
+        const all = try self.arena.alloc(usize, flow.words);
+        const some = try self.arena.alloc(usize, flow.words);
+        @memset(all, 0);
+        @memset(some, 0);
+        return .{ .live = false, .all = all, .some = some };
     }
 };

@@ -183,6 +183,10 @@ RULES = Rules(
             at_least_once="repeat_stmt",
             exits="retstat",
             breaks="break_stmt",
+            gotos="goto_stmt",
+            targets="label",
+            # (a jump to no label: the scopes() rule of labels says it)
+            on_no_label="ignore",
             variables="local_stmt",
             assigns="exprstat:has(> .values)",
             labels={"name": "names", "value": "values"},

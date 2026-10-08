@@ -85,10 +85,38 @@ def test_valid_program_has_no_errors():
         ("for i = i, 10 do print(i) end", []),
         ("local i = 1 for i = i, 10 do print(i) end", ["shadowing"]),
         ("local xs = {} for x in pairs(xs) do print(x) end", []),
+        # goto: code after it is unreachable until a label it (or another
+        # jump) goes to; variables follow the jumps, back ones too
+        ("goto skip print(1) ::skip:: print(2)", ["unreachable"]),
+        ("::top:: goto top print(1)", ["unreachable"]),
+        ("local i = 1 ::top:: i = i + 1 if i < 3 then goto top end print(i)", []),
+        ("for i = 1, 3 do if i == 2 then goto continue end print(i) ::continue:: end", []),
+        ("local x goto use x = 1 ::use:: print(x)", ["unreachable", "uninitialized"]),
+        ("local x goto set ::back:: print(x) do return end ::set:: x = 1 goto back", []),
+        ("local x ::top:: print(x) x = 1 goto top", ["uninitialized"]),
+        ("local x if y then goto out end x = 1 ::out:: print(x)", ["uninitialized"]),
+        ("do goto out end print(1) ::out::", ["unreachable"]),
     ],
 )
 def test_checks(source, expected):
     assert sorted(codes(source)) == sorted(expected)
+
+
+def test_flow_says_a_jump_has_no_label():
+    # (flow() alone, without the example's scopes() rule of labels)
+    from zrules import Rules, flow
+
+    rules = Rules(lua.PARSER, [flow(sequences="block", functions="funcbody", gotos="goto_stmt", targets="label", exits="retstat")])
+    ds = rules.check("do ::a:: end goto a goto b ::b:: local function f() goto b end")
+    # (the label `a` is in a block of its own; `b` outside the function;
+    # and after `goto a`, `goto b` can't be reached)
+    assert [(d.code, d.message, d.column) for d in ds] == [
+        ("no-label", "no visible label 'a' for this jump", 19),
+        ("unreachable", "unreachable code", 21),
+        ("no-label", "no visible label 'b' for this jump", 58),
+    ]
+    quiet = Rules(lua.PARSER, [flow(sequences="block", gotos="goto_stmt", targets="label", on_no_label="ignore")])
+    assert quiet.check("goto nowhere") == []
 
 
 def test_the_bounds_of_a_for_see_the_outer_variable():

@@ -169,17 +169,22 @@ Rules of compatibility: a type fits itself; `unknown` fits and is fitted by ever
 | `at_least_once` | | loops whose body runs before the condition |
 | `exits` | | nodes after which nothing runs |
 | `breaks`, `continues` | | |
+| `gotos` | | jumps to a label: child `label` (default the child `name`) names it |
+| `targets` | | labels, statements of a sequence: child `label` (default `name`) |
 | `must_return` | | functions whose end must not be reachable |
 | `variables` | | declarations: children `name` (one or more), `value`; without a `value` the names are followed |
 | `assigns` | | assignments: children `target` (one or more), else `name` |
-| `labels` | | role -> label for `name`, `value`, `target` |
+| `labels` | | role -> label for `name`, `value`, `target`, `label` |
 | `namespace` | the first `scopes()` rule | whose names are followed |
 | `on_unreachable` | `"warning"` | |
 | `on_missing_return` | `"error"` | |
 | `on_unassigned` | `"error"` | |
-| `messages`, `codes` | | keyed `unreachable`, `missing_return`, `unassigned`, `maybe_unassigned` |
+| `on_no_label` | `"error"` | a jump with no label to go to |
+| `messages`, `codes` | | keyed `unreachable`, `missing_return`, `unassigned`, `maybe_unassigned`, `no_label` |
 
 `variables` and `assigns` need a `scopes()` rule. A variable is followed if it is declared without a value or defined by an assignment, within the function that declares it, and only if no other function assigns it.
+
+A jump goes to the nearest label of its name among the statements of its sequence or of a sequence around it, in its function (Lua's `goto`). Code after a jump is unreachable up to a label some reachable jump goes to; at a label, a variable has a value if it has one on the way in and on every jump to it. A jump back to a label already passed walks its function again with what the jump brings, until nothing changes (a few passes at most).
 
 ## custom()
 

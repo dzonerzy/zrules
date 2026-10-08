@@ -5,6 +5,11 @@ All notable changes to zrules are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **`flow(gotos=..., targets=...)`**: control flow that knows jumps to labels (Lua's `goto`). Code after a jump is unreachable up to a label a reachable jump goes to; variables follow the jumps, back ones too (the function walked again while a jump back brings something new). A jump goes to the nearest label of its name among the statements of its sequence or of one around it, in its function; one with no label is reported (`no_label`, `on_no_label=`). The label's name is the child `label` (the child `name` unless `labels=` says another). examples/lua uses them.
+
 ## [0.1.7] - 2026-10-07
 
 ### Changed

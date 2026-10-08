@@ -260,6 +260,8 @@ fn flow(args: pyoz.Args(struct {
     exits: ?*PyObject = null,
     breaks: ?*PyObject = null,
     continues: ?*PyObject = null,
+    gotos: ?*PyObject = null,
+    targets: ?*PyObject = null,
     must_return: ?*PyObject = null,
     variables: ?*PyObject = null,
     assigns: ?*PyObject = null,
@@ -268,6 +270,7 @@ fn flow(args: pyoz.Args(struct {
     on_unreachable: ?*PyObject = null,
     on_missing_return: ?*PyObject = null,
     on_unassigned: ?*PyObject = null,
+    on_no_label: ?*PyObject = null,
     messages: ?*PyObject = null,
     codes: ?*PyObject = null,
 })) pyoz.Signature(?Rule, "Rule") {
@@ -277,6 +280,7 @@ fn flow(args: pyoz.Args(struct {
         .{ "arms", a.arms },                   .{ "otherwise", a.otherwise },           .{ "loops", a.loops },
         .{ "forever", a.forever },             .{ "at_least_once", a.at_least_once },   .{ "exits", a.exits },
         .{ "breaks", a.breaks },               .{ "continues", a.continues },           .{ "must_return", a.must_return },
+        .{ "gotos", a.gotos },                 .{ "targets", a.targets },               .{ "on_no_label", a.on_no_label },
         .{ "variables", a.variables },         .{ "assigns", a.assigns },               .{ "labels", a.labels },
         .{ "namespace", a.namespace },         .{ "on_unreachable", a.on_unreachable }, .{ "on_missing_return", a.on_missing_return },
         .{ "on_unassigned", a.on_unassigned }, .{ "messages", a.messages },             .{ "codes", a.codes },
@@ -290,7 +294,8 @@ fn flow(args: pyoz.Args(struct {
 const flow_problem_kinds = @typeInfo(flow_mod.ProblemKind).@"enum".fields.len;
 
 /// A compiled flow() rule. Problem kinds index the arrays in the order of
-/// flow_mod.ProblemKind: dead, missing_return, unassigned, maybe_unassigned.
+/// flow_mod.ProblemKind: dead, missing_return, unassigned, maybe_unassigned,
+/// no_label.
 const FlowRule = struct {
     /// The scopes() rule whose names it follows ("" = the first one)
     namespace: []const u8,
@@ -305,6 +310,8 @@ const FlowRule = struct {
     exits: []const Selector,
     breaks: []const Selector,
     continues: []const Selector,
+    gotos: []const Selector,
+    targets: []const Selector,
     must_return: []const Selector,
     variables: []const Selector,
     assigns: []const Selector,
@@ -1903,7 +1910,7 @@ const Rules = struct {
         return tr;
     }
 
-    const flow_keys = [flow_problem_kinds][:0]const u8{ "unreachable", "missing_return", "unassigned", "maybe_unassigned" };
+    const flow_keys = [flow_problem_kinds][:0]const u8{ "unreachable", "missing_return", "unassigned", "maybe_unassigned", "no_label" };
 
     fn compileFlow(state: *State, args: *PyObject) ?*const FlowRule {
         const arena = state.arena.allocator();
@@ -1916,7 +1923,8 @@ const Rules = struct {
         var labels = flow_mod.Labels{};
         const overrides = textPairs(state, args, "labels") orelse return null;
         inline for (@typeInfo(flow_mod.Labels).@"struct".fields) |field| {
-            var label: []const u8 = field.name;
+            // (a jump's label is named by its child `name` by default)
+            var label: []const u8 = if (comptime std.mem.eql(u8, field.name, "label")) "name" else field.name;
             for (overrides) |pair| {
                 if (std.mem.eql(u8, pair[0], field.name)) label = pair[1];
             }
@@ -1930,7 +1938,7 @@ const Rules = struct {
                 if (std.mem.eql(u8, pair[0], field.name)) known = true;
             }
             if (!known) {
-                raise(py.PyExc_ValueError(), "labels: unknown role '{s}': expected name, value or target", .{pair[0]});
+                raise(py.PyExc_ValueError(), "labels: unknown role '{s}': expected name, value, target or label", .{pair[0]});
                 return null;
             }
         }
@@ -1940,14 +1948,15 @@ const Rules = struct {
             "'{text}' may end without returning a value",
             "'{text}' is used before it has a value",
             "'{text}' may be used before it has a value",
+            "no visible label '{text}' for this jump",
         };
-        var codes = [flow_problem_kinds][]const u8{ "unreachable", "missing-return", "unassigned", "unassigned" };
+        var codes = [flow_problem_kinds][]const u8{ "unreachable", "missing-return", "unassigned", "unassigned", "no-label" };
         inline for (.{ .{ "messages", &messages }, .{ "codes", &codes } }) |option| {
             for (textPairs(state, args, option[0]) orelse return null) |pair| {
                 const at = for (flow_keys, 0..) |k, i| {
                     if (std.mem.eql(u8, k, pair[0])) break i;
                 } else {
-                    raise(py.PyExc_ValueError(), "{s}: unknown kind '{s}': the keys are 'unreachable', 'missing_return', 'unassigned' and 'maybe_unassigned'", .{ option[0], pair[0] });
+                    raise(py.PyExc_ValueError(), "{s}: unknown kind '{s}': the keys are 'unreachable', 'missing_return', 'unassigned', 'maybe_unassigned' and 'no_label'", .{ option[0], pair[0] });
                     return null;
                 };
                 option[1][at] = pair[1];
@@ -1968,6 +1977,8 @@ const Rules = struct {
             .exits = compileSelectors(state, py.c.PyDict_GetItemString(args, "exits"), "exits") orelse return null,
             .breaks = compileSelectors(state, py.c.PyDict_GetItemString(args, "breaks"), "breaks") orelse return null,
             .continues = compileSelectors(state, py.c.PyDict_GetItemString(args, "continues"), "continues") orelse return null,
+            .gotos = compileSelectors(state, py.c.PyDict_GetItemString(args, "gotos"), "gotos") orelse return null,
+            .targets = compileSelectors(state, py.c.PyDict_GetItemString(args, "targets"), "targets") orelse return null,
             .must_return = compileSelectors(state, py.c.PyDict_GetItemString(args, "must_return"), "must_return") orelse return null,
             .variables = compileSelectors(state, py.c.PyDict_GetItemString(args, "variables"), "variables") orelse return null,
             .assigns = compileSelectors(state, py.c.PyDict_GetItemString(args, "assigns"), "assigns") orelse return null,
@@ -1977,6 +1988,7 @@ const Rules = struct {
                 levelArg(args, "on_missing_return", .err) orelse return null,
                 unassigned,
                 unassigned,
+                levelArg(args, "on_no_label", .err) orelse return null,
             },
             .messages = messages,
             .codes = codes,
@@ -2687,6 +2699,8 @@ const Rules = struct {
                 .exits = try self.matchAll(fr.exits),
                 .breaks = try self.matchAll(fr.breaks),
                 .continues = try self.matchAll(fr.continues),
+                .gotos = try self.matchAll(fr.gotos),
+                .targets = try self.matchAll(fr.targets),
                 .must_return = try self.matchAll(fr.must_return),
                 .variables = try self.matchAll(fr.variables),
                 .assigns = try self.matchAll(fr.assigns),
@@ -3946,7 +3960,7 @@ pub const Module = pyoz.module(.{
         pyoz.func("scopes", scopes, "scopes(scope, define, use, define_outer=None, hoist=None, after=None, outside=None, builtins=None, ordered=True, namespace='name', on_undefined='error', on_redefine='error', on_unused='ignore', on_shadow='ignore', on_no_member='error', members=None, member_labels=('target', 'name'), imports=None, import_all=None, import_labels=('module', 'names', 'alias'), exports=None, on_no_module='error', on_no_export='error', on_unresolved=None, messages=None, codes=None): resolve names. `scope` nodes open a scope; `define` nodes define their text as a name in the scope around them (`define_outer`: in the scope outside that one); `use` nodes must resolve to a definition. `hoist` definitions are visible before their position; `after` definitions only once their parent node has ended. `members` nodes are accesses like a.b: the child labelled name is looked up in the scope that the child labelled target names."),
         pyoz.func("custom", custom, "custom(selector, function, code=None): call function(node, ctx) for every node matching `selector`."),
         pyoz.func("types", types, "types(basic=None, coerce=None, literals=None, containers=None, names=None, type_names=None, type_args=None, optional=None, variables=None, functions=None, structs=None, binary=None, unary=None, calls=None, index=None, assigns=None, returns=None, conditions=None, operators=None, builtins=None, labels=None, namespace=None, severity='error', codes=None, ignore=None): type-check the program. Each option names the nodes that play a role (selectors), read through labelled children; see the documentation. Needs a scopes() rule for the names."),
-        pyoz.func("flow", flow, "flow(sequences, functions=None, branches=None, arms=None, otherwise=None, loops=None, forever=None, at_least_once=None, exits=None, breaks=None, continues=None, must_return=None, variables=None, assigns=None, labels=None, namespace=None, on_unreachable='warning', on_missing_return='error', on_unassigned='error', messages=None, codes=None): follow the control flow. Reports code that can't be reached, `must_return` functions whose end can be, and variables (declared by `variables` without a value, or defined by `assigns`) used before they have a value on every path."),
+        pyoz.func("flow", flow, "flow(sequences, functions=None, branches=None, arms=None, otherwise=None, loops=None, forever=None, at_least_once=None, exits=None, breaks=None, continues=None, gotos=None, targets=None, must_return=None, variables=None, assigns=None, labels=None, namespace=None, on_unreachable='warning', on_missing_return='error', on_unassigned='error', on_no_label='error', messages=None, codes=None): follow the control flow. Reports code that can't be reached, `must_return` functions whose end can be, and variables (declared by `variables` without a value, or defined by `assigns`) used before they have a value on every path. `gotos` jump to the nearest of the `targets` (labels) named as they are (child `name`) in their sequence or one around it, in their function; a jump to no label is reported."),
         pyoz.func("version", version, "Return the zrules version string"),
     },
     .classes = &.{
